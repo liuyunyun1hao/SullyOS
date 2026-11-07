@@ -25,6 +25,63 @@ const routeMinimaxByRegion: ProxyOptions['configure'] = (proxy) => {
   };
 };
 
+// --- 本地 LLM 网关同源代理（与 scripts/local-static-server.cjs、utils/localLlmProxy.ts 配对，
+// 详见 docs/local-llm-gateway.md）---
+// 开发服务器把同源 <prefix>/* 镜像转发到本地网关（默认 /zen/* → http://127.0.0.1:9355/*），
+// 并在 /__local_llm_proxy.json 上发布 descriptor，让页面把用户配置的 loopback URL 改写成同源路径，
+// 绕开本地网关常见的 CORS 预检缺失（OPTIONS 501）。环境变量与 local-static-server.cjs 同名同义：
+// LLM_PROXY_TARGET（默认 http://127.0.0.1:9355，空字符串关闭）/ LLM_PROXY_PREFIX（默认 /zen）/
+// LLM_PROXY_ROUTES（JSON 数组多路由，覆盖单路由变量；target 只允许 loopback）。
+const isLoopbackHostname = (hostname: string): boolean => {
+  const host = hostname.toLowerCase();
+  return host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host);
+};
+
+const normalizeLocalProxyPrefix = (value: unknown): string | null => {
+  const prefix = String(value ?? '').replace(/\/+$/, '');
+  return prefix.startsWith('/') && prefix !== '/' ? prefix : null;
+};
+
+const normalizeLocalProxyTarget = (value: unknown): string | null => {
+  try {
+    const url = new URL(String(value ?? ''));
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    if (!isLoopbackHostname(url.hostname)) return null;
+    return `${url.protocol}//${url.host}`;
+  } catch { return null; }
+};
+
+const readLocalLlmProxyRoutes = (): Array<{ prefix: string; target: string }> => {
+  if (process.env.LLM_PROXY_ROUTES) {
+    try {
+      const parsed = JSON.parse(process.env.LLM_PROXY_ROUTES);
+      if (Array.isArray(parsed)) {
+        const routes = parsed
+          .map((item: any) => ({
+            prefix: normalizeLocalProxyPrefix(item?.prefix),
+            target: normalizeLocalProxyTarget(item?.target),
+          }))
+          .filter((route): route is { prefix: string; target: string } => Boolean(route.prefix && route.target));
+        if (routes.length > 0) return routes;
+      }
+    } catch { /* 格式错误落到单路由默认 */ }
+    console.warn('LLM_PROXY_ROUTES 解析失败或没有可用路由，忽略');
+  }
+  const targetEnv = process.env.LLM_PROXY_TARGET;
+  const target = targetEnv === undefined ? 'http://127.0.0.1:9355' : String(targetEnv ?? '');
+  if (!target) return [];
+  const prefix = normalizeLocalProxyPrefix(process.env.LLM_PROXY_PREFIX || '/zen');
+  const normalizedTarget = normalizeLocalProxyTarget(target);
+  if (!prefix || !normalizedTarget) {
+    console.warn('LLM_PROXY_PREFIX / LLM_PROXY_TARGET 不合法，本地代理未启用');
+    return [];
+  }
+  return [{ prefix, target: normalizedTarget }];
+};
+
+const localLlmProxyRoutes = readLocalLlmProxyRoutes();
+const LOCAL_LLM_PROXY_DESCRIPTOR_PATH = '/__local_llm_proxy.json';
+
 // 构建时抓 git 分支 + short commit + UTC+8 构建时间，注入到版本信息显示。
 // 非 git 环境（容器、tarball 部署）退化成 'unknown'，不影响构建。
 //
@@ -97,6 +154,16 @@ export default defineConfig({
       configureServer(server) {
         server.middlewares.use('/api/minimax/bake-voice', bakeVoiceMiddleware);
         server.middlewares.use('/api/friend-feed/tikhub', tikhubMiddleware);
+        // 本地 LLM 网关 descriptor：utils/localLlmProxy.ts 在页面侧同源拉取，
+        // 拿到路由后才把 loopback 网关 URL 改写成同源代理路径（docs/local-llm-gateway.md）。
+        if (localLlmProxyRoutes.length > 0) {
+          server.middlewares.use(LOCAL_LLM_PROXY_DESCRIPTOR_PATH, (_req, res) => {
+            res.statusCode = 200;
+            res.setHeader('content-type', 'application/json; charset=utf-8');
+            res.setHeader('cache-control', 'no-store');
+            res.end(JSON.stringify({ routes: localLlmProxyRoutes }));
+          });
+        }
       },
     },
   ],
@@ -112,6 +179,14 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      // 本地 LLM 网关镜像转发（docs/local-llm-gateway.md）：同源 <prefix>/* → 本地网关同路径。
+      // http-proxy 自带流式透传，SSE 不受影响；关闭代理（LLM_PROXY_TARGET=''）时这里为空。
+      ...(localLlmProxyRoutes.length > 0
+        ? (Object.fromEntries(localLlmProxyRoutes.map((route) => [
+            route.prefix,
+            { target: route.target, changeOrigin: true },
+          ])) as Record<string, ProxyOptions>)
+        : {}),
       '/api/minimax/t2a': {
         target: 'https://api.minimaxi.com',
         changeOrigin: true,

@@ -31,6 +31,7 @@ import { clampClaudeTemperature, modelRejectsSamplingParams, stripSamplingParams
 import { buildMalformedImageDiagnostics, extractImagesInPlace, deepCloneForExport, stripBackupImages, parseImageDataUrlForBackup, type BackupObjectPath, type MalformedBackupImageDiagnostic } from '../utils/backupExport';
 import { isBlobRef, getBlobForRef, restoreBlobRef, migrateDataUrlToRef, migrateAppearancePresetBlobRefs, migrateChatThemeBlobRefs, resolveBlobRefsDeep, resolveRefToDataUrl, BLOBREF_PREFIX, deleteBlobRefIfUnreferenced } from '../utils/blobRef';
 import { resolveBlobRefsInRequestBody } from '../utils/apiBlobRefs';
+import { rewriteUrlForLocalLlmProxy } from '../utils/localLlmProxy';
 import { collectBlobRefs, writeBlobsToZip, readBlobsIndex, restoreBlobsFromZip } from '../utils/backupBlobs';
 import { initPwaIcon, clearPwaIcon } from '../utils/appIcon';
 import { LEGACY_DEFAULT_WALLPAPER, isLegacyDefaultWallpaper, shouldPreserveLegacyDefaultWallpaper } from '../utils/wallpaperCompat';
@@ -1190,10 +1191,21 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               .toUpperCase();
           const requestComparisonKey = `${method} ${urlStr}`;
 
+          // 本地 LLM 网关同源改写（utils/localLlmProxy.ts，详见 docs/local-llm-gateway.md）：
+          // 页面由本地服务（local-static-server / vite dev）提供且用户配置的是 loopback 网关时，
+          // 把请求改写到同源反向代理路径，绕开本地网关常见的 CORS 预检缺失（OPTIONS 501）。
+          // 云端部署拉不到 descriptor 时原样直发，行为零变化；非 loopback 目标也一律直发。
+          // 日志、诊断、调用记录仍记用户配置的原始 urlStr——排查时看到的必须和设置页里填的一致。
+          let sendResource: RequestInfo | URL = resource;
+          if (typeof resource === 'string') {
+              try { sendResource = await rewriteUrlForLocalLlmProxy(resource, originalFetch); }
+              catch { /* descriptor 拉取异常：按原样发送 */ }
+          }
+
           // 采样参数兼容层（详见 utils/samplingParamCompat.ts）：
           // 某些模型废弃了 temperature/top_p/top_k，带上直接 400。这里在所有 /chat/completions
           // 的统一出口做发送前主动摘除，覆盖 Schedule / 记忆 / 见面等全部旁路调用点。
-          let sendArgs: [RequestInfo | URL, RequestInit?] = args;
+          let sendArgs: [RequestInfo | URL, RequestInit?] = [sendResource, config];
           // 透明流式升级状态（utils/streamUpgrade.ts）：请求侧改写 → 响应侧拼回 JSON
           let streamUpgraded = false;
           if (urlStr.includes('/chat/completions')) {
@@ -1219,7 +1231,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                               streamUpgraded = true;
                           }
                       }
-                      if (body !== rawBody) sendArgs = [resource, { ...(config as RequestInit), body }];
+                      if (body !== rawBody) sendArgs = [sendResource, { ...(config as RequestInit), body }];
                   } catch { /* 非 JSON body：原样放行 */ }
               }
 
