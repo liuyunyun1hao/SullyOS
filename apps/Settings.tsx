@@ -1,4 +1,7 @@
 import { listUserSpaces } from '../utils/userSpaces';
+import { BackupMissingAssetsNotice } from '../components/BackupMissingAssetsNotice';
+import type { BackupMissingAsset } from '../utils/backupMissingAssets';
+import { readBackupPreferences, updateBackupPreferences } from '../utils/backupPreferences';
 import {CharacterWeatherCities} from '../components/settings/CharacterAwarenessSettings';
 import {cleanCharacterWeatherCities} from '../utils/characterWeather';
 import NavigationBallSettings from '../components/settings/NavigationBallSettings';
@@ -25,7 +28,9 @@ import { useLocalBackHandler } from '../hooks/useLocalBackHandler';
 import { loadUserLocationConfig, type UserLocationConfig } from '../utils/userLocationPrivacy';
 import { saveUserLocationConfig } from '../utils/userLocation';
 import { consumeHolidaySettings, hasHolidaySettingsRequest, type UserHolidayConfig } from '../utils/userHolidays';
-import { NotionManager, FeishuManager, RealtimeContextManager, fetchOwmWeather, fetchOpenMeteoWeather } from '../utils/realtimeContext';
+import { NotionManager, FeishuManager, RealtimeContextManager } from '../utils/realtimeContext';
+import { normalizeFreeWeatherSource } from '../utils/realtimeWorldCore';
+import WeatherSourceSettings from '../components/settings/WeatherSourceSettings';
 import { XhsMcpClient } from '../utils/xhsMcpClient';
 import { resolveXhsDeploymentMode } from '../utils/xhsMcpConfig';
 import { getMcdToken, setMcdToken as saveMcdToken, isMcdEnabled, setMcdEnabled as saveMcdEnabled, testMcdConnection, resetMcdSession } from '../utils/mcdMcpClient';
@@ -48,7 +53,11 @@ import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel'
 import ActiveMsgGlobalSettingsModal from '../components/settings/ActiveMsgGlobalSettingsModal';
 import { syncAmsgLlmCredentials, syncAmsgToolConfig, syncAmsgToolConfigAndPrompts } from '../utils/amsgStateSync';
 import { ActiveMsgClient } from '../utils/activeMsgClient';
+import { ActiveMsgStore } from '../utils/activeMsgStore';
+import { AMSG_GLOBAL_CONFIG_EVENT, isAmsg2GloballyEnabled } from '../utils/amsgGlobalGate';
+import { flushAmsg2AfterReenable, setAmsg2GlobalEnabled } from '../utils/amsgGlobalSwitch';
 import VersionInfo from '../components/settings/VersionInfo';
+import SullySupportEntry, { SupportIcon } from '../components/settings/SullySupportEntry';
 import { isPushVapidReady } from '../utils/pushVapid';
 import ApiCallLogModal from '../components/settings/ApiCallLogModal';
 import StorageUsagePanel from '../components/settings/StorageUsagePanel';
@@ -80,6 +89,8 @@ import {
     setFirecrawlApiKey,
     type FirecrawlCreditUsage,
 } from '../utils/firecrawl';
+
+const SullySupportPage = React.lazy(() => import('../components/settings/SullySupportPage'));
 
 // hot_news（news.orz.ai）可选热榜平台。key 必须与 API 的 ?platform= 完全一致。
 const HOTNEWS_PLATFORM_OPTIONS: { key: string; label: string }[] = [
@@ -201,6 +212,14 @@ const flushMcpToolConfigSync = () => {
     if (!mcpToolConfigSyncTimer) return;
     clearTimeout(mcpToolConfigSyncTimer);
     runMcpToolConfigSync();
+};
+
+const cancelMcpToolConfigSync = () => {
+    if (mcpToolConfigSyncTimer) {
+        clearTimeout(mcpToolConfigSyncTimer);
+        mcpToolConfigSyncTimer = null;
+    }
+    pendingMcpToolConfigSync = null;
 };
 
 /**
@@ -564,12 +583,25 @@ const Settings: React.FC = () => {
   const presetDeleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   
   // UI States
+  const [showSupport, setShowSupport] = useState(false);
+  const supportEntryRef = useRef<HTMLButtonElement>(null);
+  const supportWasOpen = useRef(false);
+  useSettingsFocus('support', () => {
+      supportEntryRef.current?.scrollIntoView({ block: 'center' });
+      setShowSupport(true);
+  });
+  useLocalBackHandler(() => { setShowSupport(false); return true; }, 30, showSupport);
+  useEffect(() => {
+      if (!showSupport && supportWasOpen.current) supportEntryRef.current?.focus({ preventScroll: true });
+      supportWasOpen.current = showSupport;
+  }, [showSupport]);
   const [showModelModal, setShowModelModal] = useState(false);
   // 打开模型弹窗那一刻的模型名：点 × 关掉时退回它，只有「确定」/点选列表才算数。
   const modelBeforePickerRef = useRef('');
   const [showVisionModelModal, setShowVisionModelModal] = useState(false);
   const [visionModelFilter, setVisionModelFilter] = useState('');
   const [showExportModal, setShowExportModal] = useState(false); // Used for completion now
+  const [exportMissingAssets, setExportMissingAssets] = useState<BackupMissingAsset[]>([]);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resetting, setResetting] = useState(false);
   /** 云端没清干净时停在这里：本地还一个字节都没动，等用户决定重试还是照样重置。 */
@@ -702,6 +734,7 @@ const Settings: React.FC = () => {
   useLocalBackHandler(() => { closeRealtimePage(); return true; }, 30, showRealtimeModal);
   const [rtUserHolidays, setRtUserHolidays] = useState<UserHolidayConfig>(() => ({ ...(realtimeConfig.userHolidays || { enabled: false, countryCode: '' }), ...(holidaySettingsFocus ? { enabled: true } : {}) }));
   const [rtWeatherKey, setRtWeatherKey] = useState(realtimeConfig.weatherApiKey);
+  const [rtWeatherFreeSource, setRtWeatherFreeSource] = useState(() => normalizeFreeWeatherSource(realtimeConfig.weatherFreeSource));
   const [rtWeatherCities, setRtWeatherCities] = useState(()=>cleanCharacterWeatherCities(realtimeConfig.weatherCities));
   const [rtWeatherCity, setRtWeatherCity] = useState(realtimeConfig.weatherCity);
   const [rtNewsEnabled, setRtNewsEnabled] = useState(realtimeConfig.newsEnabled);
@@ -764,16 +797,67 @@ const Settings: React.FC = () => {
   const [luckinTesting, setLuckinTesting] = useState(false);
 
   const [showAmsg2Modal, setShowAmsg2Modal] = useState(false);
+  useSettingsFocus('amsg2', () => setShowAmsg2Modal(true));
   const [showAmsgCloudData, setShowAmsgCloudData] = useState(false);
+  const [amsgGlobalConfig, setAmsgGlobalConfig] = useState<{ workerUrl: string; enabled?: boolean; initializedAt?: number } | null>(null);
+  const [amsgGlobalToggling, setAmsgGlobalToggling] = useState(false);
+
+  useEffect(() => {
+      let alive = true;
+      void ActiveMsgStore.getGlobalConfig()
+          .then((cfg) => { if (alive) setAmsgGlobalConfig(cfg); })
+          .catch(() => {});
+      const onGlobalCfg = (ev: Event) => {
+          const detail = (ev as CustomEvent).detail;
+          if (detail) {
+              setAmsgGlobalConfig(detail);
+              // 总开关已落盘为暂停时，立即冲刷 800ms 防抖内的 MCP 改动——syncAmsgToolConfig 在暂停态下
+              // 仅写 localStorage 底账、零网络请求，这样重新开启后不会漏同步。
+              if (!isAmsg2GloballyEnabled(detail)) flushMcpToolConfigSync();
+          }
+      };
+      window.addEventListener(AMSG_GLOBAL_CONFIG_EVENT, onGlobalCfg);
+      return () => {
+          alive = false;
+          window.removeEventListener(AMSG_GLOBAL_CONFIG_EVENT, onGlobalCfg);
+      };
+  }, []);
+
+  const handleToggleAmsg2Global = async (next: boolean) => {
+      if (amsgGlobalToggling) return;
+      setAmsgGlobalToggling(true);
+      try {
+          const result = await setAmsg2GlobalEnabled(next, {
+              characters,
+              userProfile,
+              groups,
+              realtimeConfig,
+              apiConfig,
+          });
+          if (!next) {
+              addToast(
+                  result.cronNotice || '已暂停主动消息 2.0，云端连接与角色配置均已保留。',
+                  result.cronNotice ? 'info' : 'success',
+              );
+          } else {
+              addToast(
+                  result.cronNotice || '已恢复主动消息 2.0。',
+                  result.cronNotice ? 'info' : 'success',
+              );
+          }
+      } finally {
+          setAmsgGlobalToggling(false);
+      }
+  };
+  const [exportUserScope, setExportUserScope] = useState<'current' | 'all'>('current');
   /**
-   * 导出时带不带主动消息 2.0 的后端连接（Worker 地址 + 密钥 + 用户 id）。
+   * 备份带不带主动消息 2.0 的后端连接（Worker 地址 + 密钥 + 用户 id），手动导出和云端备份共用。
    *
    * 默认不带。备份是会被分享出去的，带上就等于把自己那台 Worker 的钥匙一起发了：
    * 对方的 App 会静默连上来，把 ta 的 API 凭据和聊天上下文写进你的 D1，而 ta 手里的
    * 主密钥能解开你那台机器上所有的密文。换设备恢复自己的备份才需要它。
    */
-  const [exportUserScope, setExportUserScope] = useState<'current' | 'all'>('current');
-  const [exportBackendConnection, setExportBackendConnection] = useState(false);
+  const [exportBackendConnection, setExportBackendConnection] = useState(() => readBackupPreferences().includeBackendConnection);
   const [showVapidModal, setShowVapidModal] = useState(false);
   const [vapidReadyTick, setVapidReadyTick] = useState(0); // 关闭 VAPID 弹窗后刷新顶层徽标
 
@@ -804,6 +888,7 @@ const Settings: React.FC = () => {
   const [testingApi, setTestingApi] = useState(false);
   const [testApiResult, setTestApiResult] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const independentImportInputRef = useRef<HTMLInputElement>(null);
   const avatarModelBackupInputRef = useRef<HTMLInputElement>(null);
   const refreshAvatarModelInventory = useCallback(async () => {
       try {
@@ -1168,7 +1253,11 @@ const Settings: React.FC = () => {
     setTestingVisionApi(true);
     setVisionTestResult(null);
     try {
-      const description = await describeImageWithVisionApi(VISION_API_TEST_IMAGE_DATA_URL, config);
+      const description = await describeImageWithVisionApi(VISION_API_TEST_IMAGE_DATA_URL, config, {
+        appId: 'settings',
+        appName: '设置',
+        purpose: '测试连接',
+      });
       setVisionTestResult(`✅ 识图成功 — ${description.slice(0, 80)}`);
       trackEvent('测试识图 API', { result: '成功' });
     } catch (error: any) {
@@ -1335,7 +1424,8 @@ const Settings: React.FC = () => {
           }
 
           // Trigger export (Context handles loading state UI)
-          const blob = await exportSystem(mode, { includeBackendConnection: exportBackendConnection, userScope: exportUserScope });
+          setExportMissingAssets([]);
+          const blob = await exportSystem(mode, { userScope: exportUserScope, onMissingAssets: setExportMissingAssets });
           
           const fileName = `Sully_Backup_${mode}_${new Date().toISOString().slice(0, 10)}.zip`;
           if (!Capacitor.isNativePlatform()) {
@@ -1361,21 +1451,21 @@ const Settings: React.FC = () => {
       }
   };
 
-  const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // 本地导入和云端恢复共用。备份里带着 Worker 后端连接时问一句：程序分不清这份文件是自己的
+  // 还是别人的（换新设备时用户 id 本来就对不上），只有拿着文件的人知道，所以把话问出去。
+  const confirmBackendRestore = (workerUrl: string) => window.confirm(
+      `这份备份里带着一个主动消息 2.0 的后端连接：\n\n${workerUrl}\n\n`
+      + '如果这是你自己导出的备份，点「确定」连上它。\n\n'
+      + '如果是别人给你的，点「取消」——连上去的话，你的 API 密钥和聊天记录会被写进对方那台服务器。\n\n'
+      + '（不连也不影响其它数据导入，之后可以在设置里手动填。）',
+  );
+
+  const handleImport = (e: React.ChangeEvent<HTMLInputElement>, asNewUsers = false) => {
       const file = e.target.files?.[0];
       if (!file) return;
 
       // Pass the File object directly to importSystem
-      importSystem(file, {
-          // 备份里带着 Worker 后端连接时问一句。程序分不清这份文件是自己的还是别人的
-          // （换新设备时用户 id 本来就对不上），只有拿着文件的人知道，所以把话问出去。
-          confirmBackendRestore: (workerUrl) => window.confirm(
-              `这份备份里带着一个主动消息 2.0 的后端连接：\n\n${workerUrl}\n\n`
-              + '如果这是你自己导出的备份，点「确定」连上它。\n\n'
-              + '如果是别人给你的，点「取消」——连上去的话，你的 API 密钥和聊天记录会被写进对方那台服务器。\n\n'
-              + '（不连也不影响其它数据导入，之后可以在设置里手动填。）',
-          ),
-      }).catch(err => {
+      importSystem(file, { asNewUsers, confirmBackendRestore }).catch(err => {
           console.error(err);
           // 只上报归类后的固定枚举：报错原文（可能含文件路径/内容片段）只留在 console
           const rawMessage = String(err?.message || '');
@@ -1394,9 +1484,11 @@ const Settings: React.FC = () => {
       });
       
       if (importInputRef.current) importInputRef.current.value = '';
+      if (independentImportInputRef.current) independentImportInputRef.current.value = '';
   };
 
   const deliverStandaloneBackup = async (blob: Blob, fileName: string, shareTitle: string) => {
+      setExportMissingAssets([]);
       if (!Capacitor.isNativePlatform()) {
           if (downloadUrlRef.current) URL.revokeObjectURL(downloadUrlRef.current);
           const url = URL.createObjectURL(blob);
@@ -1599,7 +1691,7 @@ const Settings: React.FC = () => {
       }
       setShowCloudRestoreModal(false);
       try {
-          await cloudRestoreFromWebDAV(file);
+          await cloudRestoreFromWebDAV(file, { confirmBackendRestore });
       } catch (err: any) {
           // 只区分「下载阶段」还是「导入阶段」，报错原文只进 showError / console
           trackEvent('从云端恢复失败', {
@@ -1740,6 +1832,7 @@ const Settings: React.FC = () => {
           weatherEnabled: rtWeatherEnabled,
           userHolidays: { ...rtUserHolidays, introChoice: rtUserHolidays.enabled ? 'configured' as const : 'declined' as const },
           weatherApiKey: rtWeatherKey,
+          weatherFreeSource: rtWeatherFreeSource,
           weatherCity: rtWeatherCity.trim(),
           weatherCities: cleanCharacterWeatherCities(rtWeatherCities),
           newsEnabled: rtNewsEnabled,
@@ -1773,28 +1866,6 @@ const Settings: React.FC = () => {
       syncAmsgToolConfigAndPrompts(nextRealtimeConfig, { characters, userProfile, groups });
       addToast('实时感知配置已保存', 'success');
       setShowRealtimeModal(false);
-  };
-
-  // 测试天气API连接：填了 key 测 OpenWeatherMap，没填测免费的 Open-Meteo
-  const testWeatherApi = async () => {
-      const setRtTestStatus = (value: string) => setRtTestStatuses(previous => ({ ...previous, weather: value }));
-      if (!rtWeatherCity) {
-          setRtTestStatus('请先填写城市');
-          return;
-      }
-      setRtTestStatus('正在测试...');
-      try {
-          const weather = rtWeatherKey
-              ? await fetchOwmWeather(rtWeatherCity, rtWeatherKey)
-              : await fetchOpenMeteoWeather(rtWeatherCity);
-          const source = rtWeatherKey ? 'OpenWeatherMap' : 'Open-Meteo';
-          // 刻意不带数据源名：那等价于「有没有填天气 key」，属于配置状态
-          trackEvent('测试天气数据源连接', { result: 'ok' });
-          setRtTestStatus(`连接成功！(${source}) ${weather.city}: ${weather.description}, ${weather.temp}°C`);
-      } catch (e: any) {
-          trackEvent('测试天气数据源连接', { result: 'failed' });
-          setRtTestStatus(`连接失败: ${e.message}`);
-      }
   };
 
   // 测试Notion连接
@@ -1979,7 +2050,7 @@ const Settings: React.FC = () => {
       )}
 
       {/* Header */}
-      <div className="bg-[#fffefe] border-b border-slate-200 shrink-0 z-10 sticky top-0" style={{ paddingTop: 'var(--safe-top)' }}>
+      <div className="bg-[#fffefe] border-b border-slate-200 shrink-0 z-10 sticky top-0" style={{ paddingTop: 'var(--safe-top)' }} {...(showSupport ? { inert: '' } : {})} aria-hidden={showSupport || undefined}>
         <div className="flex items-center px-4 py-3">
         <div className="flex items-center gap-2 w-full">
             <button onClick={closeApp} className="p-2 -ml-2 rounded-full hover:bg-black/5 active:scale-90 transition-transform">
@@ -1992,7 +2063,7 @@ const Settings: React.FC = () => {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-5 space-y-6 no-scrollbar pb-20">
+      <div className="flex-1 overflow-y-auto p-5 space-y-6 no-scrollbar pb-20" {...(showSupport ? { inert: '' } : {})} aria-hidden={showSupport || undefined}>
 
         <NavigationBallSettings characters={characters} loadWorlds={() => DB.getWorlds()} />
         {/* 外观救急入口统一放在设置顶部，无需进入已被错误 CSS 遮住的聊天或日记。 */}
@@ -2068,18 +2139,19 @@ const Settings: React.FC = () => {
             {listUserSpaces().length > 1 && <fieldset className="mb-4 p-3 bg-white border border-slate-200 rounded-xl"><legend className="text-xs font-bold">先选择导出范围</legend><div className="flex gap-4 text-sm">{(['current', 'all'] as const).map(scope => <label key={scope} className="flex gap-2 items-center"><input type="radio" name="user-export-scope" checked={exportUserScope === scope} onChange={() => setExportUserScope(scope)} />{scope === 'current' ? '当前用户' : '所有用户'}</label>)}</div><p className="text-xs text-slate-400 mt-2">再选择下面的导出样式。共享素材只打包一次。</p></fieldset>}
             <StorageUsagePanel />
             <WebCacheControl />
+            <BackupMissingAssetsNotice items={exportMissingAssets} />
 
             <label className="mb-3 flex items-start gap-2 rounded-xl border border-slate-200 bg-white p-3 cursor-pointer">
                 <input
                     type="checkbox"
                     checked={exportBackendConnection}
-                    onChange={(e) => setExportBackendConnection(e.target.checked)}
+                    onChange={(e) => setExportBackendConnection(updateBackupPreferences({ includeBackendConnection: e.target.checked }).includeBackendConnection)}
                     className="mt-0.5 shrink-0"
                 />
                 <span className="text-[11px] leading-relaxed text-slate-600">
                     <span className="font-bold">包含主动消息 2.0 的后端连接</span>
                     <span className="block text-slate-400">
-                        换设备恢复时勾上，Worker 地址和密钥会一起带走。
+                        换设备恢复时勾上，导出和云端备份都会带上 Worker 地址和密钥。
                         <span className="font-bold text-rose-500">勾着导出的备份不要分享给别人</span>
                         ——拿到文件的人能连上你那台 Worker，也能解开里面的聊天记录。
                     </span>
@@ -2113,6 +2185,11 @@ const Settings: React.FC = () => {
                     <span>导入备份 (.zip / .json)</span>
                 </div>
                 <input type="file" ref={importInputRef} className="hidden" accept=".json,.zip" onChange={handleImport} />
+                <button onClick={() => independentImportInputRef.current?.click()} className="py-4 px-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs font-bold text-emerald-800 active:scale-95 transition-all">
+                    从其他网址 / App 迁入独立用户
+                    <span className="block mt-2 text-[11px] font-normal leading-relaxed">建议使用整合备份，自动新建用户并保留聊天、记忆和素材。共用当前系统设置，主动消息和离开后消息需重新开启。</span>
+                </button>
+                <input type="file" ref={independentImportInputRef} aria-label="迁入独立用户备份" className="hidden" accept=".json,.zip" onChange={event => handleImport(event, true)} />
             </div>
 
             <p className="text-[10px] text-slate-400 px-1 mb-4 leading-relaxed">
@@ -2495,7 +2572,8 @@ const Settings: React.FC = () => {
                                     max_tokens: 5,
                                     stream: localStream,
                                 }),
-                            });
+                                __sullyMeta: { appId: 'settings', appName: '设置', purpose: '测试连接' },
+                            } as RequestInit);
                             if (res.ok) {
                                 // 走 safeResponseJson —— 它能透明把 SSE 流响应拼成普通 chat/completion 结构
                                 const data = await safeResponseJson(res);
@@ -3243,8 +3321,39 @@ const Settings: React.FC = () => {
                 </button>
             </div>
             <p className="text-xs text-slate-500 leading-relaxed">
-                角色到点自动给你发消息，App 关着也能收。需要你自己部署一个 Cloudflare Worker（自带 D1 数据库 + 定时触发），在配置里填地址即可。聊天上云（即时对话）与定时主动消息都由它承担。
+                角色到点自动给你发消息，App 关着也能收。需要一个属于你自己的 Cloudflare Worker（自带 D1 数据库 + 定时触发），在配置里粘一枚 Token 就能一键部署。聊天上云（即时对话）与定时主动消息都由它承担。
             </p>
+            {amsgGlobalConfig?.workerUrl?.trim() ? (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-2xl border border-violet-100 bg-white/80 px-4 py-3">
+                    <div className="min-w-0">
+                        <div className="text-xs font-semibold text-slate-700">
+                            总开关 · {isAmsg2GloballyEnabled(amsgGlobalConfig) ? '运行中' : '已暂停'}
+                        </div>
+                        <div className="mt-0.5 text-[11px] leading-relaxed text-slate-500">
+                            {isAmsg2GloballyEnabled(amsgGlobalConfig)
+                                ? '关闭后立即暂停本机所有 Worker 请求、状态同步与即时对话，保留全部连接配置。'
+                                : '已暂停本机所有云端请求，聊天回到本地生成，已有连接与角色配置均保留。'}
+                        </div>
+                    </div>
+                    <button
+                        type="button"
+                        role="switch"
+                        aria-checked={isAmsg2GloballyEnabled(amsgGlobalConfig)}
+                        aria-label="主动消息 2.0 总开关"
+                        disabled={amsgGlobalToggling}
+                        onClick={() => void handleToggleAmsg2Global(!isAmsg2GloballyEnabled(amsgGlobalConfig))}
+                        className={`w-12 h-7 rounded-full transition-colors relative shrink-0 disabled:opacity-50 ${
+                            isAmsg2GloballyEnabled(amsgGlobalConfig) ? 'bg-violet-500' : 'bg-slate-200'
+                        }`}
+                    >
+                        <span
+                            className={`absolute top-0.5 left-0.5 w-6 h-6 bg-white rounded-full shadow transition-all duration-200 ${
+                                isAmsg2GloballyEnabled(amsgGlobalConfig) ? 'translate-x-5' : 'translate-x-0'
+                            }`}
+                        />
+                    </button>
+                </div>
+            ) : null}
             <button type="button" onClick={() => setShowAmsgCloudData(true)} className="mt-3 w-full rounded-2xl border border-violet-100 bg-violet-50/60 px-4 py-3 text-left text-xs text-violet-700">
                 <span className="block font-semibold">云端数据管理</span>
                 <span className="mt-1 block text-[11px] text-slate-500">查看 Worker 实际保存的数据，按项清理或彻底移除角色。</span>
@@ -3360,8 +3469,15 @@ const Settings: React.FC = () => {
         )}
 
         <VersionInfo />
+        <SullySupportEntry ref={supportEntryRef} onOpen={() => setShowSupport(true)} />
 
       </div>
+
+      {showSupport && <React.Suspense fallback={
+          <section className="sully-support support-page" aria-label="打赏 Sully" onKeyDown={event => {
+              if (event.key === 'Escape') { event.stopPropagation(); setShowSupport(false); }
+          }}><div className="support-loading"><header className="support-header"><button autoFocus className="header-back" type="button" onClick={() => setShowSupport(false)} aria-label="返回设置"><SupportIcon name="back" /></button><h1>打赏 Sully</h1><span /></header><p role="status">猫猫正在准备小票…</p></div></section>
+      }><SullySupportPage onClose={() => setShowSupport(false)} /></React.Suspense>}
 
       {/* Cloud Config Modal */}
       <Modal isOpen={showCloudModal} title="云端备份配置" onClose={() => setShowCloudModal(false)}>
@@ -3842,6 +3958,7 @@ const Settings: React.FC = () => {
                   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-8 h-8"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>
               </div>
               <p className="text-sm font-bold text-slate-700">备份文件已生成！</p>
+              <div className="text-left"><BackupMissingAssetsNotice items={exportMissingAssets} /></div>
               <p className="text-xs text-slate-500">如果浏览器没有自动下载，请点击下方链接。</p>
               {downloadUrl && <a href={downloadUrl} download={downloadFileName} className="text-primary text-sm underline block py-2">点击手动下载 .zip</a>}
           </div>
@@ -3876,14 +3993,14 @@ const Settings: React.FC = () => {
                       <div className="space-y-2">
                           <div>
                               <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">OpenWeatherMap API Key（可选）</label>
-                              <input type="password" value={rtWeatherKey} onChange={e => setRtWeatherKey(e.target.value)} className="w-full bg-white/80 border border-emerald-200 rounded-xl px-3 py-2 text-sm font-mono" placeholder="留空则用免费的 Open-Meteo，无需注册" />
+                              <input type="password" value={rtWeatherKey} onChange={e => setRtWeatherKey(e.target.value)} className="w-full bg-white/80 border border-emerald-200 rounded-xl px-3 py-2 text-sm font-mono" placeholder="留空可选免费源 1 / 2，无需注册" />
                           </div>
                           <div>
                               <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">默认天气城市</label>
                               <input type="text" value={rtWeatherCity} onChange={e => setRtWeatherCity(e.target.value)} className="w-full bg-white/80 border border-emerald-200 rounded-xl px-3 py-2 text-sm" placeholder="北京 / Beijing / Shanghai" />
                           </div>
-<button onClick={testWeatherApi} className="w-full py-2 bg-emerald-100 text-emerald-600 text-xs font-bold rounded-xl active:scale-95 transition-transform">测试天气API</button>
-                          {renderRtTestStatus('weather')}
+                          <WeatherSourceSettings city={rtWeatherCity} apiKey={rtWeatherKey} value={rtWeatherFreeSource} onChange={setRtWeatherFreeSource}
+                              onTestResult={ok => trackEvent('测试天气数据源连接', { result: ok ? 'ok' : 'failed' })} />
                           <CharacterWeatherCities characters={characters} value={rtWeatherCities} defaultCity={rtWeatherCity} onChange={setRtWeatherCities}/>
                       </div>
                   )}
@@ -4420,6 +4537,14 @@ const Settings: React.FC = () => {
         realtimeConfig={realtimeConfig}
         onOpenVapid={() => { setShowAmsg2Modal(false); setShowVapidModal(true); }}
         onOpenCloudData={() => { setShowAmsg2Modal(false); setShowAmsgCloudData(true); }}
+        onToggleGlobalEnabled={handleToggleAmsg2Global}
+        onReenabledAfterConnect={() => void flushAmsg2AfterReenable({
+          characters,
+          userProfile,
+          groups,
+          realtimeConfig,
+          apiConfig,
+        })}
       />
       <AmsgCloudDataModal
         isOpen={showAmsgCloudData}

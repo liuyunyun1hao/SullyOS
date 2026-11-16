@@ -54,7 +54,8 @@ const { storeState } = vi.hoisted(() => ({
     markedNotices: [] as Array<{ charId: string; ids: string[] }>,
   },
 }));
-vi.mock('./activeMsgStore', () => ({
+vi.mock('./activeMsgStore', async () => ({
+  isInstantChatSwitchedOn: (await vi.importActual<typeof import('./activeMsgStore')>('./activeMsgStore')).isInstantChatSwitchedOn,
   ActiveMsgStore: {
     ensureUserId: async () => TEST_USER_ID,
     getGlobalConfig: async () => {
@@ -90,6 +91,7 @@ import {
   setInstantChatPending,
   settleInstantChatApiLog,
   settleInstantChatExpiredNotices,
+  settleLateCloudEmotionEvalLog,
   stageInstantChatExpiredNotices,
 } from './amsgInstantChat';
 import { FIRE_PACK_VERSION, unpackStateValue } from './amsgFirePack';
@@ -609,6 +611,88 @@ describe('上云的这一轮也进「API 调用记录」', () => {
     await vi.waitFor(() => expect(logged).toHaveLength(1));
     expect(logged[0]).toMatchObject({ id: 'cloud-uuid-dead', pending: false, ok: false });
   });
+
+  it('带情绪评估一起上云 → 同时记主聊天与云端情绪评估两笔，回复带回副 API 用量时一并结清', async () => {
+    stubFirePackDeps();
+    mockInstantChatFetch(202, { status: 'accepted', uuid: 'uuid-emo' });
+    const logged = captureLog();
+    await sendInstantChatTurn({
+      char: CHAR,
+      chatMessages: [{ role: 'user', content: '今天好累' }],
+      api: API,
+      userProfile: USER,
+      groups: [],
+      realtimeConfig: {} as any,
+      emotionEval: {
+        prompt: '请评估当前情绪',
+        api: { baseUrl: 'https://sub.example.com/v1', apiKey: 'sk-sub', model: 'gemini-2.5-flash' },
+      },
+    });
+    await vi.waitFor(() => expect(logged).toHaveLength(2));
+    expect(logged.find((e) => e.id === 'cloud-emotion-uuid-emo')).toMatchObject({
+      route: 'cloud-emotion-eval',
+      pending: true,
+      ok: true,
+      model: 'gemini-2.5-flash',
+      appName: '消息',
+      charId: CHAR.id,
+      purpose: '情绪评估',
+    });
+
+    logged.length = 0;
+    settleInstantChatApiLog('uuid-emo', {
+      amsgUsage: { promptTokens: 2000, completionTokens: 120 },
+      amsgUsageComplete: true,
+      amsgToolTrace: [{ name: 'recall', count: 1 }],
+      amsgEmotionDone: true,
+      amsgEmotionUsage: { promptTokens: 1500, completionTokens: 60 },
+    });
+    await vi.waitFor(() => expect(logged).toHaveLength(2));
+    expect(logged.find((e) => e.id === 'cloud-uuid-emo')).toMatchObject({
+      pending: false,
+      ok: true,
+      promptTokens: 2000,
+      completionTokens: 120,
+      totalTokens: 2120,
+    });
+    expect(logged.find((e) => e.id === 'cloud-uuid-emo')?.tokensPartial).toBeUndefined();
+    expect(logged.find((e) => e.id === 'cloud-emotion-uuid-emo')).toMatchObject({
+      pending: false,
+      ok: true,
+      promptTokens: 1500,
+      completionTokens: 60,
+      totalTokens: 1560,
+    });
+  });
+
+  it('情绪评估晚投（amsgEmotionPending）→ 正文先结清，情绪评估等旁路补落后结清', async () => {
+    stubFirePackDeps();
+    mockInstantChatFetch(202, { status: 'accepted', uuid: 'uuid-late-emo' });
+    const logged = captureLog();
+    await sendInstantChatTurn({
+      char: CHAR,
+      chatMessages: [{ role: 'user', content: '在忙吗' }],
+      api: API,
+      userProfile: USER,
+      groups: [],
+      realtimeConfig: {} as any,
+      emotionEval: { prompt: '评估情绪' },
+    });
+    await vi.waitFor(() => expect(logged).toHaveLength(2));
+
+    logged.length = 0;
+    settleInstantChatApiLog('uuid-late-emo', {
+      amsgUsage: { promptTokens: 800, completionTokens: 40 },
+      amsgEmotionPending: true,
+    });
+    await vi.waitFor(() => expect(logged).toHaveLength(1));
+    expect(logged[0].id).toBe('cloud-uuid-late-emo');
+
+    logged.length = 0;
+    settleLateCloudEmotionEvalLog('uuid-late-emo', true);
+    await vi.waitFor(() => expect(logged).toHaveLength(1));
+    expect(logged[0]).toMatchObject({ id: 'cloud-emotion-uuid-late-emo', pending: false, ok: true });
+  });
 });
 
 describe('待收记录（「正在输入…」那盏灯的唯一依据）', () => {
@@ -697,6 +781,18 @@ describe('开关', () => {
   it('开关没开 → 不走（每条消息都读这一份，别处不做第二道门）', async () => {
     storeState.config = { ...storeState.config, instantChatEnabled: false };
     expect(await isInstantChatReady()).toBe(false);
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: false, reason: 'disabled' });
+  });
+
+  // 很多人配好了 2.0 却没看懂这个开关、一直没开：没点过的，Worker 连上过就默认开。
+  it('没点过开关、Worker 连接验证成功过 → 默认走云端', async () => {
+    storeState.config = { ...storeState.config, instantChatEnabled: undefined, initializedAt: 1 };
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: true });
+  });
+
+  // 只填了地址的那种上云会发一条挂一条，又不退回本地，不能默认开。
+  it('没点过开关、只填了地址没连上过 → 不走', async () => {
+    storeState.config = { ...storeState.config, instantChatEnabled: undefined, initializedAt: undefined };
     expect(await resolveInstantChatReadiness()).toEqual({ ready: false, reason: 'disabled' });
   });
 
@@ -791,6 +887,11 @@ describe('开关', () => {
     expect(await resolveInstantChatReadiness()).toEqual({ ready: true, workerBundleCurrent: false });
     storeState.config = { ...storeState.config, workerBundleVersion: null };
     expect(await resolveInstantChatReadiness()).toEqual({ ready: true, workerBundleCurrent: false });
+  });
+
+  it('存量版本比当前 bundle 新（App 是缓存的旧构建）→ workerBundleCurrent: true，SAR 回合照常上云', async () => {
+    storeState.config = { ...storeState.config, instantChatSupported: true, workerBundleVersion: '2999-01-01.2' };
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: true, workerBundleCurrent: true });
   });
 
   it('从没探过版本（undefined）→ 不给结论，调用方放行', async () => {

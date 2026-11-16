@@ -6,6 +6,7 @@ import { CharacterProfile, UserProfile, Message, Emoji, EmojiCategory, GroupProf
 import { DB } from '../utils/db';
 import { ChatPrompts } from '../utils/chatPrompts';
 import { safeFetchJson, safeResponseJson } from '../utils/safeApi';
+import type { ApiCallMeta } from '../utils/apiCallLog';
 import { KeepAlive } from '../utils/keepAlive';
 import { ContextBuilder } from '../utils/context';
 import { ChatParser } from '../utils/chatParser';
@@ -42,6 +43,9 @@ import {
 import { ActiveMsgStore } from '../utils/activeMsgStore';
 import { markAmsgStateDirty, startAmsgChatPresence, stopAmsgChatPresence } from '../utils/amsgStateSync';
 import { getLastRealUserMessageAt } from '../utils/amsg2ExpireGuard';
+import { getLastAwayAnchorAt } from '../utils/awayMessageCore';
+import { syncCloudAwayTask } from '../utils/awayMessage';
+import { disarmDateLeaveReminder } from '../utils/dateLeaveReminder';
 import { getPendingTasks, hasActiveAiTask, isAmsg2EnabledForChar } from '../utils/amsg2Tasks';
 import { buildAmsg2NoticesText, buildAmsg2TaskContextText, collectAmsg2TaskContext, insertAmsg2TaskContextBlock } from '../utils/amsg2TaskContext';
 import { resolveCharTimeZone } from '../utils/timezone';
@@ -51,6 +55,7 @@ import { announceInstantChatRoute, getInstantChatPending, resolveInstantChatRead
 import { INSTANT_TOTAL_TIMEOUT_MS } from '../worker/amsg/src/instantChat';
 import { appendInstantTraceEntry } from '../utils/instantTraceLog';
 import { AMSG2_TOOL_NAMES, buildAmsg2Tools, createAmsg2ToolSession, executeAmsg2ToolWithOutcome, isAmsg2GlobalReady, type Amsg2ToolOutcome } from '../utils/amsg2ToolBridge';
+import { buildReplyScopeRule } from '../utils/replyScope';
 import { AMSG2_EMPTY_REPLY_PROMPT, AMSG2_WRAP_UP_PROMPT, createAmsg2StallTracker, extractToolRoundLeadIn, mergeToolRoundLeadIns } from '../utils/amsg2ToolLoop';
 import { buildLimitsBrief, resolveAmsgLimits } from '../utils/amsgLimits';
 import { shouldSendThinkingParams } from '../utils/thinkingGate';
@@ -369,6 +374,7 @@ export async function evaluateEmotionBackground(
     api: { baseUrl: string; apiKey: string; model: string; stream?: boolean },
     signal?: AbortSignal,
     secretOrigin?: SecretNoteOriginPromise,
+    metaOverride?: Partial<ApiCallMeta>,
 ): Promise<string | null> {
     // 全局横幅「xx 正在感受…」（ChatBroadcast）。这里是所有本地评估路径的汇聚点
     // （主链路 fire & forget / OSContext 主动消息），在函数级
@@ -404,7 +410,14 @@ export async function evaluateEmotionBackground(
             // injection+innerState 很长, 会被截断成半截 JSON → buff 静默丢失.
             max_tokens: 8000,
         };
-        const evalMeta = { appName: '消息', charId: charData.id, charName: charData.name, purpose: '情绪评估' };
+        const evalMeta: ApiCallMeta = {
+            appId: 'chat',
+            appName: '消息',
+            charId: charData.id,
+            charName: charData.name,
+            purpose: '情绪评估',
+            ...metaOverride,
+        };
         let data: any;
         try {
             data = await safeFetchJson(`${baseUrl}/chat/completions`, {
@@ -781,6 +794,15 @@ export const useChatAI = ({
             }
             const fullHistory = contextRange?.messages || null;
             const contextMsgs = fullHistory || currentMsgs;
+            // 离开后消息（云端）：按最近一次在场互动（用户发言或线下见面/通话记录）把任务往后推。不等它，失败只影响这一条。
+            const awayLastUserAt = getLastAwayAnchorAt(contextMsgs);
+            if (char.awayMessage?.enabled && awayLastUserAt != null) {
+                void syncCloudAwayTask({
+                    char, lastUserAt: awayLastUserAt, userProfile, groups, realtimeConfig, apiConfig, updateCharacter,
+                });
+            }
+            // 见面离开提醒：走开后在私聊里跟 TA 说上话了，这次离开就结束了。没有待发的提醒时不发请求。
+            void disarmDateLeaveReminder({ char, updateCharacter });
             // 空范围先报可操作的本地错误，避免继续识图/召回和发送 system-only 请求。
             // 原始消息可能是无文字图片或卡片，此处只判角色；正文有效性在格式化后校验。
             assertChatHasDialogue(contextMsgs.map(message => ({
@@ -1087,7 +1109,7 @@ export const useChatAI = ({
                         // 静默熄灯, 用户只看到「情绪永远不更新」—— 给一条可操作的提示。
                         announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {
                             charId: charIdAtArm, charName: charNameAtArm,
-                            reason: '云端情绪评估超时无回音——worker 可能是旧版（不支持情绪评估），请到 设置→主动消息 2.0 重新部署 worker 后重试',
+                            reason: '云端情绪评估超时无回音——worker 可能是旧版（不支持情绪评估），请去「设置 → 主动消息 2.0」点一下「更新 Worker」后重试',
                         });
                     }, delayMs));
                 };
@@ -1122,7 +1144,7 @@ export const useChatAI = ({
             //  - thinking.type='enabled' / budget_tokens：Anthropic 原生与多数官方代理
             //  - reasoning_effort：OpenAI 系（o1/o3、GLM-4.5、deepseek-reasoner 等）
             //  - extra_body.thinking：LiteLLM 系桥
-            // 关掉则一个都不传，避免无谓的 thinking token 计费。
+            // 关掉则不主动传这些参数；这不等于关闭模型推理，Gemini 等仍可能产生思考用量。
             // ⚠️ 工具模式(瑞幸点单/麦当劳)下绝不带 thinking/reasoning 参数: "thinking + tools" 同发
             //    Gemini 等会直接 400 INVALID_ARGUMENT —— 表现就是"开了思考链的角色一点单就报错,
             //    换个没开思考链的角色就好"。工具循环优先, 思考链这一轮让步。
@@ -1253,6 +1275,15 @@ export const useChatAI = ({
                 // 工具循环的 loopMessages 是 baseReqBody.messages 追加尾巴，前缀没动，下标照用。
                 return insertAmsg2TaskContextBlock(messages, block, payload.volatileTailIndex);
             };
+            // 带工具时说清「这次回复」从哪条消息算起，同样插在易变尾段之前。
+            // 即时对话上云用的是 fullMessages，worker 那边自己加，这里不会重复。
+            if (baseReqBody.tools?.length || mcpToolResolve) {
+                baseReqBody.messages = insertAmsg2TaskContextBlock(
+                    baseReqBody.messages,
+                    { role: 'system', content: buildReplyScopeRule('user') },
+                    payload.volatileTailIndex,
+                );
+            }
 
             // ─── 即时对话（主动消息 2.0 云端生成）分支 ───
             // 这一轮的上下文 + 任务一个 POST 上云，云端跑完走推送回来（收件箱同一条管线入库），
@@ -1410,7 +1441,7 @@ export const useChatAI = ({
             // 别在用户正聊时又弹主动消息。即时对话路径在上方已 return，天然不重复开 lease。
             // 只对已排程 AI 任务的角色开租约：其余角色没有 worker 消费，开了纯浪费还刷 warn。
             const amsg2Cfg = char.activeMsg2Config;
-            if (amsg2Cfg?.enabled && hasActiveAiTask(amsg2Cfg)) {
+            if (amsg2ToolsInjected && amsg2Cfg?.enabled && hasActiveAiTask(amsg2Cfg)) {
                 startAmsgChatPresence(char.id, getLastRealUserMessageAt(contextMsgs));
             }
 
@@ -1608,7 +1639,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '麦当劳点餐回复' }));
                     updateTokenUsage(data, historyMsgCount, `mcd-propose-${it + 1}`);
                     // 第二轮跳过 (我们已经禁用了 tools)
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
@@ -1714,7 +1745,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '瑞幸点单回复' }));
                     updateTokenUsage(data, historyMsgCount, `luckin-propose-${it + 1}`);
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
                 }
@@ -1887,7 +1918,7 @@ export const useChatAI = ({
                             content: wrapUpKind === 'amsg2-stalled'
                                 || (wrapUpKind === 'hard-limit' && !mcpToolResolve && !payload.flags.luckinChatActive)
                                 ? AMSG2_WRAP_UP_PROMPT
-                                : `[系统消息：工具阶段${stalled ? '连续两轮没有产生新结果' : '已到本轮安全上限'}。请停止调用工具，基于已经拿到的结果直接用角色语气回复；如目标仍未完成，请如实说明卡在哪一步。不要输出工具名、参数或这条系统消息。]`,
+                                : `[系统消息：工具阶段${stalled ? '连续两轮没有产生新结果' : '已到这次回复的安全上限'}。请停止调用工具，基于已经拿到的结果直接用角色语气回复；如目标仍未完成，请如实说明卡在哪一步。不要输出工具名、参数或这条系统消息。]`,
                         });
                     }
                     const followBody = { ...baseReqBody, messages: followMessages };
@@ -1895,11 +1926,16 @@ export const useChatAI = ({
                         delete followBody.tools;
                         delete followBody.tool_choice;
                     }
+                    const loopPurpose = payload.flags.luckinChatActive
+                        ? '瑞幸点单续写'
+                        : mcpCallsThisRound > 0
+                            ? 'MCP 工具续写'
+                            : '排程工具续写';
                     data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: loopPurpose }));
                     updateTokenUsage(data, historyMsgCount, `${payload.flags.luckinChatActive ? 'luckin-chat' : 'mcp-chat'}-${it + 1}`);
                     if (forceWrapUp) break;
                 }
@@ -1925,7 +1961,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(rescueBody),
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '排程后补充回复' }));
                     updateTokenUsage(data, historyMsgCount, 'amsg2-empty-rescue');
                 }
                 if (amsg2ToolRounds > 0) {
@@ -1976,7 +2012,7 @@ export const useChatAI = ({
                             signal: replyRun.signal,
                             method: 'POST', headers,
                             body: JSON.stringify(wrapBody)
-                        }));
+                        }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP 工具收尾回复' }));
                         updateTokenUsage(data, historyMsgCount, `mcp-text-wrap-${it + 1}`);
                         break;
                     }
@@ -2005,7 +2041,7 @@ export const useChatAI = ({
                     if (reachedHardLimit) {
                         textLoopMessages.push({
                             role: 'user',
-                            content: '[系统消息：工具阶段已到本轮安全上限。停止调用工具，基于已有结果直接回复；如目标未完成就如实说明。不要输出工具调用格式或提及本消息。]',
+                            content: '[系统消息：工具阶段已到这次回复的安全上限。停止调用工具，基于已有结果直接回复；如目标未完成就如实说明。不要输出工具调用格式或提及本消息。]',
                         });
                     }
                     setSearchStatus('正在整理 MCP 工具结果...');
@@ -2014,7 +2050,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP 工具续写' }));
                     updateTokenUsage(data, historyMsgCount, `mcp-text-${it + 1}`);
                     if (reachedHardLimit) break;
                 }

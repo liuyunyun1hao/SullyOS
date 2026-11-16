@@ -207,6 +207,8 @@ export const LAST_SKIP_REASONS = [
   'min-gap',
   'recurring-unanswered',
   'daily-limit',
+  'chat-overlap',
+  'in-person',
 ] as const;
 
 export interface AmsgLastSkip {
@@ -225,6 +227,8 @@ export interface AmsgLastSkip {
    * min-gap               角色自排的任务到点时，离它上一条主动消息还没隔够用户设的间隔
    * recurring-unanswered  重复的任务到点时，用户已经连续几次没回它了（回话后恢复）
    * daily-limit           今天主动发的次数已到用户设的每日上限
+   * chat-overlap          写到一半用户开口聊上了，这句没看到新对话，推送前拦下
+   * in-person             到点时用户正在和这个角色见面，人就在面前，不发手机消息
    */
   reason: (typeof LAST_SKIP_REASONS)[number];
   skippedAt: number;
@@ -291,6 +295,10 @@ export const describeLastSkip = (skip: AmsgLastSkip, formatTime: (ms: number) =>
       return `${when} 那条重复消息这次没发——你已经连续几次没回它了，先停一停；你回一句话，它就照常恢复。`;
     case 'daily-limit':
       return `${when} 那次主动消息没发——今天 ta 主动找你的次数已经到了你设的每日上限，跳过的这次不会补发，明天重新计数。`;
+    case 'chat-overlap':
+      return `${when} 那次主动消息没发——ta 写好的时候你们正好聊上了，那句话没看到你刚说的，就没发出去。`;
+    case 'in-person':
+      return `${when} 那次主动消息没发——当时你们正在见面，人就在面前，就没再发消息；这次不会补发。`;
   }
 };
 
@@ -425,6 +433,11 @@ export interface AmsgFirePack {
   template: string;
   /** 用户上次真实主动发消息的时间（epoch ms）；没有聊天记录时为 null。 */
   lastUserMessageAt: number | null;
+  /**
+   * 离开后消息计时起点（epoch ms）：用户上次真实发言，或最近一条线下见面 / 实时通话记录
+   * （见 utils/awayMessageCore.ts）。可选字段，不改 FIRE_PACK_VERSION，旧包缺省退回 lastUserMessageAt。
+   */
+  lastAwayAnchorAt?: number | null;
   /**
    * 角色的 IANA 时区 id（角色开了自定义时区用角色的，没开用打包设备的）。
    * worker 渲染一切给角色看的时间都以它为参照系（Intl 处理夏令时）。必填：
@@ -913,6 +926,8 @@ export const renderFirePack = (
      * 传进来；不传用包里那份。
      */
     lastUserMessageAt?: number | null;
+    /** 到点必发、不给角色选择不说（离开后消息）：模板里【开口之前】那段整个拿掉。 */
+    mustSpeak?: boolean;
   },
 ): string => {
   const tz: AmsgTzRef = { tzId: pack.tzId };
@@ -927,6 +942,7 @@ export const renderFirePack = (
   const awayHint = buildAwayHint(pack.targetName, timeSinceUser);
 
   let out = pack.template;
+  if (extras?.mustSpeak) out = out.split(`${BEFORE_SPEAK_LINES.join('\n')}\n`).join('');
   out = fillSlot(out, AMSG_SLOT_CURRENT_TIME, currentTime);
   // 对方那边的钟：跟上面那行是两个主体各自的时间，文案里各自写清主语（见 buildUserClockHint）。
   out = fillSlot(out, AMSG_SLOT_USER_CLOCK, buildUserClockHint(nowMs, tz, { tzId: pack.userTzId }, pack.targetName));
@@ -975,7 +991,7 @@ export const describeFirePackVersion = (value: string): string => {
     return `包是 v${v}、worker 要 v${FIRE_PACK_VERSION} —— 前端比 worker 旧，打开一次网页让它重新上传`;
   }
   if (typeof v === 'number') {
-    return `包是 v${v}、worker 只认 v${FIRE_PACK_VERSION} —— worker bundle 是旧的，去设置页重新粘贴部署`;
+    return `包是 v${v}、worker 只认 v${FIRE_PACK_VERSION} —— worker bundle 是旧的，去「设置 → 主动消息 2.0」点一下「更新 Worker」`;
   }
   return '包里没有版本号（数据损坏）';
 };
@@ -1016,6 +1032,7 @@ export const parseFirePack = (value: string): AmsgFirePack | null => {
       chatFieldOk(parsed.chat) &&
       typeof parsed.template === 'string' && parsed.template.length > 0 &&
       (parsed.lastUserMessageAt === null || typeof parsed.lastUserMessageAt === 'number') &&
+      (parsed.lastAwayAnchorAt === undefined || parsed.lastAwayAnchorAt === null || typeof parsed.lastAwayAnchorAt === 'number') &&
       typeof parsed.tzId === 'string' && parsed.tzId.length > 0 &&
       typeof parsed.userTzId === 'string' && parsed.userTzId.length > 0 &&
       typeof parsed.targetName === 'string' &&

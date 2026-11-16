@@ -352,9 +352,17 @@ function cleanCharacterWeatherCities(value) {
   return Object.fromEntries(Object.entries(value).filter(([id, city]) => id && typeof city === "string" && city.trim()).map(([id, city]) => [id, city.trim().slice(0, 100)]));
 }
 function weatherForCharacter(config, charId) {
-  const city = charId && Object.hasOwn(config.weatherCities || {}, charId) ? config.weatherCities?.[charId] : void 0;
+  const city = charId && Object.prototype.hasOwnProperty.call(config.weatherCities || {}, charId) ? config.weatherCities?.[charId] : void 0;
   return typeof city === "string" && city.trim() ? { ...config, weatherCity: city.trim().slice(0, 100) } : config;
 }
+
+// utils/weatherSources.ts
+var normalizeFreeWeatherSource = (value) => value === "wttr" ? "wttr" : "open-meteo";
+var WEATHER_SOURCE_LABELS = {
+  "open-meteo": "\u514D\u8D39\u6E90 1 \xB7 Open-Meteo",
+  wttr: "\u514D\u8D39\u6E90 2 \xB7 wttr.in",
+  owm: "OpenWeatherMap"
+};
 
 // utils/proxyWorker.ts
 var DEFAULT_PROXY_WORKER = "https://proxy.friedsully.com";
@@ -421,6 +429,7 @@ var parseToolConfig = (value) => {
       delete parsed.mcpServers;
     }
     if (parsed.weatherCities !== void 0) parsed.weatherCities = cleanCharacterWeatherCities(parsed.weatherCities);
+    parsed.weatherFreeSource = normalizeFreeWeatherSource(parsed.weatherFreeSource);
     return parsed;
   } catch {
     return null;
@@ -1081,6 +1090,8 @@ var renderFirePack = (pack, nowMs, taskInstruction, extras) => {
   const timeSinceUser = formatTimeSinceUser(diffMinutes);
   const awayHint = buildAwayHint(pack.targetName, timeSinceUser);
   let out = pack.template;
+  if (extras?.mustSpeak) out = out.split(`${BEFORE_SPEAK_LINES.join("\n")}
+`).join("");
   out = fillSlot(out, AMSG_SLOT_CURRENT_TIME, currentTime);
   out = fillSlot(out, AMSG_SLOT_USER_CLOCK, buildUserClockHint(nowMs, tz, { tzId: pack.userTzId }, pack.targetName));
   out = fillSlot(out, AMSG_SLOT_TIME_SINCE_USER, timeSinceUser);
@@ -1116,7 +1127,7 @@ var describeFirePackVersion = (value) => {
     return `\u5305\u662F v${v}\u3001worker \u8981 v${FIRE_PACK_VERSION} \u2014\u2014 \u524D\u7AEF\u6BD4 worker \u65E7\uFF0C\u6253\u5F00\u4E00\u6B21\u7F51\u9875\u8BA9\u5B83\u91CD\u65B0\u4E0A\u4F20`;
   }
   if (typeof v === "number") {
-    return `\u5305\u662F v${v}\u3001worker \u53EA\u8BA4 v${FIRE_PACK_VERSION} \u2014\u2014 worker bundle \u662F\u65E7\u7684\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u7C98\u8D34\u90E8\u7F72`;
+    return `\u5305\u662F v${v}\u3001worker \u53EA\u8BA4 v${FIRE_PACK_VERSION} \u2014\u2014 worker bundle \u662F\u65E7\u7684\uFF0C\u53BB\u300C\u8BBE\u7F6E \u2192 \u4E3B\u52A8\u6D88\u606F 2.0\u300D\u70B9\u4E00\u4E0B\u300C\u66F4\u65B0 Worker\u300D`;
   }
   return "\u5305\u91CC\u6CA1\u6709\u7248\u672C\u53F7\uFF08\u6570\u636E\u635F\u574F\uFF09";
 };
@@ -1134,7 +1145,7 @@ var chatFieldOk = (chat) => {
 var parseFirePack = (value) => {
   try {
     const parsed = JSON.parse(value);
-    if (parsed && typeof parsed === "object" && parsed.v === FIRE_PACK_VERSION && chatFieldOk(parsed.chat) && typeof parsed.template === "string" && parsed.template.length > 0 && (parsed.lastUserMessageAt === null || typeof parsed.lastUserMessageAt === "number") && typeof parsed.tzId === "string" && parsed.tzId.length > 0 && typeof parsed.userTzId === "string" && parsed.userTzId.length > 0 && typeof parsed.targetName === "string" && typeof parsed.builtAt === "number" && Array.isArray(parsed.pendingTasks) && (parsed.scene === null || typeof parsed.scene === "object") && typeof parsed.selfScheduleEnabled === "boolean") {
+    if (parsed && typeof parsed === "object" && parsed.v === FIRE_PACK_VERSION && chatFieldOk(parsed.chat) && typeof parsed.template === "string" && parsed.template.length > 0 && (parsed.lastUserMessageAt === null || typeof parsed.lastUserMessageAt === "number") && (parsed.lastAwayAnchorAt === void 0 || parsed.lastAwayAnchorAt === null || typeof parsed.lastAwayAnchorAt === "number") && typeof parsed.tzId === "string" && parsed.tzId.length > 0 && typeof parsed.userTzId === "string" && parsed.userTzId.length > 0 && typeof parsed.targetName === "string" && typeof parsed.builtAt === "number" && Array.isArray(parsed.pendingTasks) && (parsed.scene === null || typeof parsed.scene === "object") && typeof parsed.selfScheduleEnabled === "boolean") {
       return parsed;
     }
   } catch {
@@ -1398,7 +1409,19 @@ function buildPlateJobMessages(job) {
     { role: "user", content: PLATE_USER_TURN }
   ];
 }
+var normalizePlateUsage = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const u = value;
+  const promptTokens = typeof u.promptTokens === "number" && Number.isFinite(u.promptTokens) ? u.promptTokens : void 0;
+  const completionTokens = typeof u.completionTokens === "number" && Number.isFinite(u.completionTokens) ? u.completionTokens : void 0;
+  if (promptTokens === void 0 && completionTokens === void 0) return void 0;
+  return {
+    ...promptTokens !== void 0 ? { promptTokens } : {},
+    ...completionTokens !== void 0 ? { completionTokens } : {}
+  };
+};
 function buildPlateConsolidateResult(args) {
+  const usage = normalizePlateUsage(args.usage);
   return {
     resultKind: PLATE_CONSOLIDATE_RESULT_KIND,
     v: 1,
@@ -1406,7 +1429,8 @@ function buildPlateConsolidateResult(args) {
     charId: args.charId,
     items: args.items,
     rooms: args.rooms.map((r) => ({ room: r.room, entryIds: r.entryIds })),
-    ...snapshotTimeFields(args.snapshotAt)
+    ...snapshotTimeFields(args.snapshotAt),
+    ...usage ? { usage } : {}
   };
 }
 
@@ -1537,7 +1561,7 @@ function pickStaleStoppedReplyKeys(rows, nowMs = Date.now(), protectKey) {
 // worker/amsg/src/index.ts
 import { DurableObject } from "cloudflare:workers";
 
-// node_modules/.pnpm/@rei-standard+amsg-server@3.2.0-next.2_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-R2CRPRKR.mjs
+// ../../node_modules/.pnpm/@rei-standard+amsg-server@3_f2a08373d30841ce79e2e19c7fb88ed9/node_modules/@rei-standard/amsg-server/dist/chunk-R2CRPRKR.mjs
 var CLEANUP_BATCH_LIMIT = 100;
 var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
   "user_id",
@@ -1557,7 +1581,7 @@ var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
 var TASK_DELIVERY_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count";
 var TASK_DETAIL_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at";
 
-// node_modules/.pnpm/@rei-standard+amsg-shared@0.5.0-next.0/node_modules/@rei-standard/amsg-shared/dist/index.mjs
+// ../../node_modules/.pnpm/@rei-standard+amsg-shared@0.5.0-next.0/node_modules/@rei-standard/amsg-shared/dist/index.mjs
 var TEXT_ENCODER = new TextEncoder();
 var TEXT_DECODER = new TextDecoder("utf-8", { fatal: false });
 function toUint8(buf) {
@@ -2795,7 +2819,7 @@ function stringifyDecisionForError(value) {
   }
 }
 
-// node_modules/.pnpm/@rei-standard+amsg-server@3.2.0-next.2_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-WFKLHUUE.mjs
+// ../../node_modules/.pnpm/@rei-standard+amsg-server@3_f2a08373d30841ce79e2e19c7fb88ed9/node_modules/@rei-standard/amsg-server/dist/chunk-WFKLHUUE.mjs
 var DAY_MS = 24 * 60 * 60 * 1e3;
 var MAX_LISTED_SKIPPED_OCCURRENCES = 32;
 var MAX_ADJUST_STEPS = 32;
@@ -11955,6 +11979,56 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
   return { fetch: fetch2, scheduled, runTask: runTask2, getSchemaVersion: getSchemaVersion2, ensureSchema: ensureSchema2 };
 }
 
+// utils/assistantThinking.ts
+var isThinkingPart = (part) => part?.thought === true || ["thinking", "thought", "reasoning", "reasoning.text", "reasoning.summary"].includes(part?.type);
+var isOpaquePart = (part) => ["redacted_thinking", "reasoning.encrypted", "thought_signature"].includes(part?.type);
+function plainText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(plainText).join("");
+  if (!value || typeof value !== "object" || isOpaquePart(value)) return "";
+  return plainText(value.text ?? value.thinking ?? value.summary ?? value.content ?? value.value);
+}
+function contentParts(value) {
+  if (typeof value === "string") return { content: value, reasoning: "" };
+  if (Array.isArray(value)) return value.map(contentParts).reduce((all, part) => ({
+    content: all.content + part.content,
+    reasoning: all.reasoning + part.reasoning
+  }), { content: "", reasoning: "" });
+  if (!value || typeof value !== "object" || isOpaquePart(value)) return { content: "", reasoning: "" };
+  if (isThinkingPart(value)) return { content: "", reasoning: plainText(value) };
+  return contentParts(value.text ?? value.content ?? value.value);
+}
+function readAssistantMessage(message) {
+  const parts = contentParts(message?.content);
+  const aliases = [message?.reasoning_content, message?.reasoning, message?.thinking].map(plainText);
+  const native = aliases.find((text2) => text2.trim().length > 0) || aliases.find((text2) => text2.length > 0) || "";
+  const details = Array.isArray(message?.reasoning_details) ? message.reasoning_details.filter(isThinkingPart).map(plainText).join("") : "";
+  const reasoning = [native.trim() ? native : details || native, parts.reasoning].filter(Boolean);
+  return { content: parts.content, reasoning: [...new Set(reasoning)].join("\n\n") };
+}
+function splitInlineThinking(text2) {
+  const open = /<(think|thinking|thought)(?:\s[^>]*)?>/gi;
+  let content = "", cursor = 0;
+  const blocks = [];
+  let match;
+  while (match = open.exec(text2)) {
+    content += text2.slice(cursor, match.index);
+    const close = new RegExp(`<\\/\\s*${match[1]}\\s*>`, "gi");
+    close.lastIndex = open.lastIndex;
+    const end = close.exec(text2);
+    const block = text2.slice(open.lastIndex, end ? end.index : text2.length).trim();
+    if (block) blocks.push(block);
+    cursor = end ? close.lastIndex : text2.length;
+    open.lastIndex = cursor;
+    if (!end) break;
+  }
+  return { content: content + text2.slice(cursor), reasoning: blocks.join("\n\n") };
+}
+function readAssistantThinking(message, override) {
+  const parts = readAssistantMessage(message);
+  return [override?.trim() || parts.reasoning.trim(), splitInlineThinking(parts.content).reasoning].filter(Boolean).join("\n\n");
+}
+
 // utils/voiceTextDedup.ts
 function deduplicateVoiceText(text2) {
   if (/\[html\]|<翻[译譯]>|```/i.test(text2)) return text2;
@@ -12013,7 +12087,7 @@ function extractFriendFeedReplyTags(raw, namespace = "FRIEND_FEED_REPLY") {
   return { text: text2 + raw.slice(cursor), actions };
 }
 
-// node_modules/.pnpm/@rei-standard+amsg-instant@0.12.0-next.0/node_modules/@rei-standard/amsg-instant/dist/index.mjs
+// ../../node_modules/.pnpm/@rei-standard+amsg-instant@0.12.0-next.0/node_modules/@rei-standard/amsg-instant/dist/index.mjs
 var MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
 var WEB_PUSH_MAX_BODY_BYTES2 = 4096;
 var WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES2 = 16 + 4 + 1 + 65 + 1 + 16;
@@ -12023,8 +12097,8 @@ var LONGEST_MESSAGE_KIND = Object.values(MESSAGE_KIND).reduce((longest, kind) =>
 var PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 function segmentTextWithProtectedBlocks(text2, options) {
   if (!text2) return [];
-  const splitAndSanitize = (plainText) => {
-    const chunks = options.splitText(plainText).filter((c) => c !== "");
+  const splitAndSanitize = (plainText2) => {
+    const chunks = options.splitText(plainText2).filter((c) => c !== "");
     return chunks.map((chunk) => ({
       raw: chunk,
       sanitized: options.sanitizeText ? options.sanitizeText(chunk) : chunk,
@@ -12070,8 +12144,8 @@ function segmentTextWithProtectedBlocks(text2, options) {
   const resolveField = (field, raw, match) => typeof field === "function" ? field(raw, match) : field;
   for (const m of validMatches) {
     if (m.index > cursor) {
-      const plainText = text2.substring(cursor, m.index);
-      segments.push(...splitAndSanitize(plainText));
+      const plainText2 = text2.substring(cursor, m.index);
+      segments.push(...splitAndSanitize(plainText2));
     }
     const previewStr = resolveField(m.patternDef.preview, m.raw, m.matchObj);
     const metaData = resolveField(m.patternDef.meta, m.raw, m.matchObj);
@@ -12091,8 +12165,8 @@ function segmentTextWithProtectedBlocks(text2, options) {
     cursor = m.index + m.length;
   }
   if (cursor < text2.length) {
-    const plainText = text2.substring(cursor);
-    segments.push(...splitAndSanitize(plainText));
+    const plainText2 = text2.substring(cursor);
+    segments.push(...splitAndSanitize(plainText2));
   }
   return segments;
 }
@@ -12120,7 +12194,7 @@ var stripMarkdownDividers = (t) => t.replace(/^\s*---\s*$/gm, "").replace(/^\s*[
 var stripBackticks = (t) => t.replace(/`(\[\[[\s\S]*?\]\])`/g, "$1").replace(/``+/g, "").replace(/(^|\s)`(\s|$)/gm, "$1$2");
 var stripLegacyTrans = (t) => t.replace(/%%TRANS%%[\s\S]*/gi, "");
 var collapseWhitespace = (t) => t.replace(/\n{3,}/g, "\n\n").trim();
-var stripThinkBlocks = (t) => t.replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, "").replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, "");
+var stripThinkBlocks = (t) => splitInlineThinking(t).content;
 var stripInnerState = (t) => t.replace(/\[\[INNER_STATE:\s*[\s\S]*?\]\]/g, "");
 var replaceMarkdownLinks = (t) => t.replace(/\[([^\]]+)\]\([^)]+\)/g, "[\u94FE\u63A5\uFF1A$1]");
 var replaceSendEmoji = (t) => t.replace(/\[\[SEND_EMOJI[:：]\s*(.+?)\]\]/g, "[\u8868\u60C5\uFF1A$1]");
@@ -12273,7 +12347,7 @@ function sanitizeIntoSegments(text2) {
   const ATOM_MARKER = String.fromCharCode(2);
   const atomBlocks = [];
   const atomSegments = segmentTextWithProtectedBlocks(cleaned, {
-    splitText: (plainText) => [plainText],
+    splitText: (plainText2) => [plainText2],
     protectedPatterns: [
       {
         pattern: /\[html\][\s\S]*?\[\/html\]/i,
@@ -13393,7 +13467,7 @@ var buildMcpFireBlock = (resolve, opts) => {
     howTo,
     "\u7EAA\u5F8B\uFF1A\u4E0D\u9700\u8981\u5C31\u522B\u786C\u8C03\uFF1B\u6CA1\u6536\u5230\u7CFB\u7EDF\u8FD4\u56DE\u524D\u4E0D\u8981\u58F0\u79F0\u5DE5\u5177\u6210\u529F\uFF0C\u4E5F\u4E0D\u8981\u7F16\u9020\u7ED3\u679C\uFF1B\u5DE5\u5177\u5931\u8D25\u5C31\u6362\u4E2A\u65B9\u5F0F\u6216\u5982\u5B9E\u5E26\u8FC7\uFF1B\u7ED3\u679C\u53EA\u6311\u76F8\u5173\u90E8\u5206\u7528\u89D2\u8272\u8BED\u6C14\u8F6C\u8FF0\uFF0C\u522B\u590D\u8BFB JSON\u3002",
     "\u591A\u6B65\u4EFB\u52A1\uFF1A\u5148\u505A\u5FC5\u8981\u68C0\u67E5\uFF0C\u968F\u540E\u7ACB\u523B\u8C03\u7528\u80FD\u63A8\u8FDB\u76EE\u6807\u7684\u52A8\u4F5C\u5DE5\u5177\uFF1B\u4E0D\u8981\u53CD\u590D\u8BFB\u53D6\u540C\u4E00\u4EFD\u8BF4\u660E\u6216\u72B6\u6001\u3002\u6267\u884C\u52A8\u4F5C\u540E\u53EF\u4EE5\u518D\u6B21\u68C0\u67E5\u65B0\u72B6\u6001\uFF0C\u5E76\u7EE7\u7EED\u5230\u76EE\u6807\u5B8C\u6210\u6216\u5DE5\u5177\u660E\u786E\u5931\u8D25\u3002",
-    `\u526F\u4F5C\u7528\u64CD\u4F5C\uFF1A${userName} \u672C\u8F6E\u5DF2\u7ECF\u660E\u786E\u8981\u6C42\u6267\u884C\u7684\u89C6\u4E3A\u5DF2\u786E\u8BA4\uFF1B\u6CA1\u6709\u660E\u786E\u8981\u6C42\u65F6\u624D\u5148\u786E\u8BA4\u3002`,
+    `\u526F\u4F5C\u7528\u64CD\u4F5C\uFF1A${userName} \u5728\u6700\u65B0\u6D88\u606F\u91CC\u5DF2\u7ECF\u660E\u786E\u8981\u6C42\u6267\u884C\u7684\u89C6\u4E3A\u5DF2\u786E\u8BA4\uFF1B\u6CA1\u6709\u660E\u786E\u8981\u6C42\u65F6\u624D\u5148\u786E\u8BA4\u3002`,
     "\u53EF\u7528\u5DE5\u5177\uFF1A",
     ...lines,
     "---"
@@ -13412,6 +13486,8 @@ var AMSG2_SCHEDULE_SECRECY_NOTE = "\u4E0D\u8981\u5411\u7528\u6237\u590D\u8FF0\u6
 var AMSG2_SCHEDULE_NOT_YET_NOTE = "\u6392\u5728\u672A\u6765\u7684\u4E8B\u5230\u70B9\u81EA\u5DF1\u4F1A\u54CD\uFF0C\u4E0D\u7528\u4F60\u73B0\u5728\u63D0\u524D\u66FF\u5B83\u5F00\u53E3\u2014\u2014\u8FD8\u6CA1\u5230\u90A3\u4E2A\u65F6\u523B\u7684\u5C31\u8BA9\u5B83\u5B89\u9759\u5F85\u7740\uFF0C\u522B\u6BCF\u8F6E\u90FD\u62FF\u5B83\u8D77\u8BDD\u5934\u3001\u8FFD\u7740\u95EE\u8FDB\u5C55\u3002\u5BF9\u65B9\u81EA\u5DF1\u63D0\u8D77\uFF0C\u6216\u8005\u771F\u5230\u4E86\u90A3\u4E2A\u70B9\uFF0C\u624D\u662F\u8BF4\u5B83\u7684\u65F6\u5019\u3002";
 var describeExpirePolicy = (policy) => policy === "force" ? "\u5230\u70B9\u5FC5\u53D1" : "\u5230\u70B9\u770B\u60C5\u51B5";
 var describeTaskMode = (task) => {
+  if (task.away) return "\u79BB\u5F00\u540E\u6D88\u606F";
+  if (task.dateLeave) return "\u89C1\u9762\u79BB\u5F00\u63D0\u9192";
   if (task.mode === "fixed") return "\u56FA\u5B9A\u6D88\u606F";
   if (task.mode === "prompted") return `\u63D0\u793A\u65B9\u5411\u300C${task.promptHint || ""}\u300D`;
   return task.promptHint ? `\u81EA\u52A8\uFF08\u7075\u611F\uFF1A${task.promptHint}\uFF09` : "\u81EA\u52A8";
@@ -13608,6 +13684,10 @@ var buildTaskInstruction = (mode, promptHint) => {
     promptHint?.trim() ? `\u53EF\u9009\u7075\u611F\u8865\u5145\uFF1A${promptHint.trim()}` : "\u53EF\u9009\u7075\u611F\u8865\u5145\uFF1A\u65E0"
   ].join("\n");
 };
+var AMSG_AWAY_MESSAGE_META = "amsgAwayMessage";
+var AMSG_AWAY_DELAY_META = "amsgAwayDelayMinutes";
+var AMSG_DATE_LEAVE_META = "amsgDateLeave";
+var AMSG_DATE_LEAVE_DELAY_META = "amsgDateLeaveDelayMinutes";
 var pad22 = (n) => n.toString().padStart(2, "0");
 var hasExplicitOffset = (s) => /(?:Z|[+-]\d{2}:?\d{2})$/i.test(s.trim());
 var wallClockIso = (ms, tz) => {
@@ -14133,7 +14213,7 @@ function buildScheduledPush(message, build, extraMeta, bannerBody) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-11-07.1";
+var AMSG_BUNDLE_VERSION = "2026-11-14.3";
 
 // worker/amsg/src/reproduction.ts
 async function writeDiagnosticStage(writeState, runId, event, fields = {}) {
@@ -14177,9 +14257,21 @@ var reproductionHandler = {
     });
     if (decision.decision === "tool-request") return { decision: "skip-push", reason: "diagnostic-tools-disabled" };
     if (decision.decision === "skip-push") return { decision: "skip-push", reason: decision.reason };
-    return { decision: "finish", pushPayloads: decision.pushPayloads.map((payload) => ({
+    const rawUsage = ctx.usage ?? ctx.llmResponse?.usage;
+    const promptTokens = typeof rawUsage?.prompt_tokens === "number" && Number.isFinite(rawUsage.prompt_tokens) ? rawUsage.prompt_tokens : void 0;
+    const completionTokens = typeof rawUsage?.completion_tokens === "number" && Number.isFinite(rawUsage.completion_tokens) ? rawUsage.completion_tokens : void 0;
+    const amsgUsage = promptTokens !== void 0 || completionTokens !== void 0 ? {
+      ...promptTokens !== void 0 ? { promptTokens } : {},
+      ...completionTokens !== void 0 ? { completionTokens } : {}
+    } : void 0;
+    return { decision: "finish", pushPayloads: decision.pushPayloads.map((payload, index) => ({
       ...payload,
-      metadata: { charId: DIAGNOSTIC_CHAR_ID, amsgKind: "diagnostic", amsgDiagnosticRunId: diagnostic.runId }
+      metadata: {
+        charId: DIAGNOSTIC_CHAR_ID,
+        amsgKind: "diagnostic",
+        amsgDiagnosticRunId: diagnostic.runId,
+        ...amsgUsage && index === decision.pushPayloads.length - 1 ? { amsgUsage } : {}
+      }
     })) };
   }
 };
@@ -14419,9 +14511,23 @@ var plateConsolidateHandler = {
       await discardJob(ctx.writeState, jobId);
       return { decision: "skip-push", reason: "plate-emit-result-unsupported" };
     }
+    const rawUsage = ctx.usage ?? ctx.llmResponse?.usage;
+    const promptTokens = typeof rawUsage?.prompt_tokens === "number" && Number.isFinite(rawUsage.prompt_tokens) ? rawUsage.prompt_tokens : void 0;
+    const completionTokens = typeof rawUsage?.completion_tokens === "number" && Number.isFinite(rawUsage.completion_tokens) ? rawUsage.completion_tokens : void 0;
+    const usage = promptTokens !== void 0 || completionTokens !== void 0 ? {
+      ...promptTokens !== void 0 ? { promptTokens } : {},
+      ...completionTokens !== void 0 ? { completionTokens } : {}
+    } : void 0;
     try {
       await ctx.emitResult({
-        ...buildPlateConsolidateResult({ jobId, charId: job.charId, items, rooms: job.rooms, snapshotAt: job.snapshotAt }),
+        ...buildPlateConsolidateResult({
+          jobId,
+          charId: job.charId,
+          items,
+          rooms: job.rooms,
+          snapshotAt: job.snapshotAt,
+          ...usage ? { usage } : {}
+        }),
         // 背景工作，整理完不该把人叫回来看。show:false 的 payload 上游只落收件箱、
         // 不发推送，客户端下次上线补收。
         notification: { show: false }
@@ -14462,7 +14568,20 @@ var getKindFireStash = (scratch) => {
 var FIRE_SKIP_RESULT_KIND = "fire-skipped";
 var SILENT_REASONS = /* @__PURE__ */ new Set(["schedule-off"]);
 var shouldReportFireSkip = (reason) => !SILENT_REASONS.has(reason);
+var normalizeSkipUsage = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const u = value;
+  const promptTokens = typeof u.promptTokens === "number" && Number.isFinite(u.promptTokens) ? u.promptTokens : void 0;
+  const completionTokens = typeof u.completionTokens === "number" && Number.isFinite(u.completionTokens) ? u.completionTokens : void 0;
+  if (promptTokens === void 0 && completionTokens === void 0) return void 0;
+  return {
+    ...promptTokens !== void 0 ? { promptTokens } : {},
+    ...completionTokens !== void 0 ? { completionTokens } : {},
+    ...u.tokensPartial === true ? { tokensPartial: true } : {}
+  };
+};
 function buildFireSkipResult(args) {
+  const usage = normalizeSkipUsage(args.usage);
   return {
     resultKind: FIRE_SKIP_RESULT_KIND,
     v: 1,
@@ -14476,7 +14595,9 @@ function buildFireSkipResult(args) {
         ...args.task.promptHint ? { promptHint: args.task.promptHint } : {},
         recurrenceType: args.task.recurrenceType
       }
-    } : {}
+    } : {},
+    ...usage ? { usage } : {},
+    ...args.proactiveKind ? { proactiveKind: args.proactiveKind } : {}
   };
 }
 
@@ -14486,7 +14607,7 @@ var CHAT_PRESENCE_TTL_MS = 45e3;
 var parseAmsgChatPresence = (raw) => {
   try {
     const value = raw ? JSON.parse(raw) : null;
-    return value?.v === 1 && typeof value.charId === "string" && typeof value.activeAt === "number" && (value.lastUserMessageAt === null || typeof value.lastUserMessageAt === "number") ? value : null;
+    return value?.v === 1 && typeof value.charId === "string" && typeof value.activeAt === "number" && (value.lastUserMessageAt === null || typeof value.lastUserMessageAt === "number") && (value.scene === void 0 || value.scene === "date") ? value : null;
   } catch {
     return null;
   }
@@ -14494,6 +14615,11 @@ var parseAmsgChatPresence = (raw) => {
 var isFreshChatPresence = (value, charId, nowMs) => Boolean(
   value && value.v === 1 && value.charId === charId && value.activeAt <= nowMs + 1e4 && nowMs - value.activeAt <= CHAT_PRESENCE_TTL_MS
 );
+var chattedDuringFire = (value, charId, nowMs, seenLastUserMessageAt) => {
+  if (!value || value.charId !== charId) return false;
+  if (isFreshChatPresence(value, charId, nowMs)) return true;
+  return value.lastUserMessageAt != null && (seenLastUserMessageAt == null || value.lastUserMessageAt > seenLastUserMessageAt);
+};
 
 // utils/realtimeWorldCore.ts
 var readJson = async (res) => {
@@ -14505,6 +14631,41 @@ var readJson = async (res) => {
   }
 };
 var geocodeCache = /* @__PURE__ */ new Map();
+var WEATHER_REQUEST_TIMEOUT_MS = 8e3;
+var fetchWeatherJson = async (url, stage, timeoutMs = WEATHER_REQUEST_TIMEOUT_MS) => {
+  if (timeoutMs <= 0) throw new Error(`${stage}\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u6216\u68C0\u67E5\u7F51\u7EDC`);
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${stage}\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u6216\u68C0\u67E5\u7F51\u7EDC`));
+      controller.abort();
+    }, timeoutMs);
+  });
+  const request = async () => {
+    let response;
+    try {
+      response = await fetch(url, { signal: controller.signal });
+    } catch {
+      throw new Error(`${stage}\u8FDE\u63A5\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u6216\u7A0D\u540E\u91CD\u8BD5`);
+    }
+    if (!response.ok) {
+      const hint = response.status === 429 ? "\uFF0C\u8BF7\u6C42\u8FC7\u591A\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" : "";
+      throw new Error(`${stage} HTTP ${response.status}${hint}`);
+    }
+    try {
+      return await readJson(response);
+    } catch {
+      throw new Error(`${stage}\u54CD\u5E94\u8BFB\u53D6\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5`);
+    }
+  };
+  try {
+    return await Promise.race([request(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+var isWeatherNumber = (value) => typeof value === "number" && Number.isFinite(value);
 var WMO_WEATHER_CODES = {
   0: { description: "\u6674", icon: "01d" },
   1: { description: "\u5927\u81F4\u6674\u6717", icon: "02d" },
@@ -14535,45 +14696,51 @@ var WMO_WEATHER_CODES = {
   96: { description: "\u96F7\u9635\u96E8\u4F34\u5C0F\u51B0\u96F9", icon: "11d" },
   99: { description: "\u96F7\u9635\u96E8\u4F34\u5927\u51B0\u96F9", icon: "11d" }
 };
-var fetchOwmWeather = async (city, apiKey) => {
-  const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${apiKey}&units=metric&lang=zh_cn`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`OpenWeatherMap HTTP ${response.status}`);
+var fetchOwmWeather = async (city, apiKey, timeoutMs = WEATHER_REQUEST_TIMEOUT_MS) => {
+  const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city.trim())}&appid=${encodeURIComponent(apiKey.trim())}&units=metric&lang=zh_cn`;
+  const data = await fetchWeatherJson(url, "OpenWeatherMap \u5929\u6C14\u670D\u52A1", timeoutMs);
+  if (![data?.main?.temp, data?.main?.feels_like, data?.main?.humidity].every(isWeatherNumber)) {
+    throw new Error("OpenWeatherMap \u5929\u6C14\u6570\u636E\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
   }
-  const data = await readJson(response);
   return {
     temp: Math.round(data.main.temp),
     feelsLike: Math.round(data.main.feels_like),
     humidity: data.main.humidity,
-    description: data.weather[0]?.description || "\u672A\u77E5",
-    icon: data.weather[0]?.icon || "01d",
+    description: data.weather?.[0]?.description || "\u672A\u77E5",
+    icon: data.weather?.[0]?.icon || "01d",
     city: data.name
   };
 };
-var fetchOpenMeteoWeather = async (city) => {
+var fetchOpenMeteoWeather = async (city, timeoutMs = WEATHER_REQUEST_TIMEOUT_MS) => {
+  city = city.trim();
+  if (!city) throw new Error("\u8BF7\u5148\u586B\u5199\u57CE\u5E02");
+  const deadline = Date.now() + timeoutMs;
   let geo = geocodeCache.get(city);
   if (!geo) {
-    const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh&format=json`;
-    const geoRes = await fetch(geoUrl);
-    if (!geoRes.ok) {
-      throw new Error(`Open-Meteo geocoding HTTP ${geoRes.status}`);
+    const lookup = (name) => fetchWeatherJson(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=zh&format=json`,
+      "Open-Meteo \u57CE\u5E02\u67E5\u8BE2",
+      deadline - Date.now()
+    );
+    let hit = (await lookup(city))?.results?.[0];
+    if (!hit && /^[\u3400-\u9fff]{2,}市$/.test(city)) {
+      hit = (await lookup(city.slice(0, -1)))?.results?.[0];
     }
-    const geoData = await readJson(geoRes);
-    const hit = geoData.results?.[0];
     if (!hit) {
-      throw new Error(`Open-Meteo \u627E\u4E0D\u5230\u57CE\u5E02: ${city}`);
+      throw new Error(`Open-Meteo \u627E\u4E0D\u5230\u57CE\u5E02: ${city}\uFF0C\u8BF7\u5C1D\u8BD5\u57CE\u5E02\u7B80\u79F0\u6216\u82F1\u6587\u540D\uFF08\u5982\u5317\u4EAC / Beijing\uFF09`);
+    }
+    if (!isWeatherNumber(hit.latitude) || Math.abs(hit.latitude) > 90 || !isWeatherNumber(hit.longitude) || Math.abs(hit.longitude) > 180 || typeof hit.name !== "string" || !hit.name.trim()) {
+      throw new Error("Open-Meteo \u57CE\u5E02\u6570\u636E\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
     }
     geo = { latitude: hit.latitude, longitude: hit.longitude, name: hit.name };
     geocodeCache.set(city, geo);
   }
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${geo.latitude}&longitude=${geo.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code&timezone=auto`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Open-Meteo HTTP ${response.status}`);
+  const data = await fetchWeatherJson(url, "Open-Meteo \u5929\u6C14\u670D\u52A1", deadline - Date.now());
+  const current = data?.current;
+  if (![current?.temperature_2m, current?.apparent_temperature, current?.relative_humidity_2m, current?.weather_code].every(isWeatherNumber)) {
+    throw new Error("Open-Meteo \u5929\u6C14\u6570\u636E\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
   }
-  const data = await readJson(response);
-  const current = data.current;
   const wmo = WMO_WEATHER_CODES[current.weather_code] || { description: "\u672A\u77E5", icon: "01d" };
   return {
     temp: Math.round(current.temperature_2m),
@@ -14584,17 +14751,108 @@ var fetchOpenMeteoWeather = async (city) => {
     city: geo.name
   };
 };
-var fetchWeatherWithFallback = async (city, apiKey) => {
-  if (!city) return null;
-  if (apiKey) {
+var WWO_TO_WMO = {
+  113: 0,
+  116: 2,
+  119: 3,
+  122: 3,
+  143: 45,
+  176: 61,
+  179: 71,
+  182: 67,
+  185: 56,
+  200: 95,
+  227: 75,
+  230: 75,
+  248: 45,
+  260: 48,
+  263: 51,
+  266: 53,
+  281: 56,
+  284: 57,
+  293: 61,
+  296: 61,
+  299: 63,
+  302: 63,
+  305: 65,
+  308: 65,
+  311: 66,
+  314: 67,
+  317: 67,
+  320: 67,
+  323: 71,
+  326: 71,
+  329: 73,
+  332: 73,
+  335: 75,
+  338: 75,
+  350: 77,
+  353: 80,
+  356: 81,
+  359: 82,
+  362: 67,
+  365: 67,
+  368: 85,
+  371: 86,
+  374: 77,
+  377: 77,
+  386: 95,
+  389: 95,
+  392: 95,
+  395: 95
+};
+var fetchWttrWeather = async (city, timeoutMs = WEATHER_REQUEST_TIMEOUT_MS) => {
+  city = city.trim();
+  if (!city) throw new Error("\u8BF7\u5148\u586B\u5199\u57CE\u5E02");
+  if (/^\.{1,2}$|[/\\:@~?#]/.test(city)) throw new Error("\u8BF7\u586B\u5199\u57CE\u5E02\u540D\u79F0\uFF0C\u4E0D\u8981\u586B\u5199\u7F51\u5740");
+  const data = await fetchWeatherJson(`https://wttr.in/${encodeURIComponent(city)}?format=j1&lang=zh`, "wttr.in \u5929\u6C14\u670D\u52A1", timeoutMs);
+  const current = data?.current_condition?.[0];
+  const number = (value) => typeof value === "string" && value.trim() ? Number(value) : typeof value === "number" ? value : NaN;
+  const temp = number(current?.temp_C), feelsLike = number(current?.FeelsLikeC), humidity = number(current?.humidity);
+  if (![temp, feelsLike, humidity].every(isWeatherNumber) || humidity < 0 || humidity > 100) {
+    throw new Error("wttr.in \u5929\u6C14\u6570\u636E\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
+  }
+  const code = number(current?.weatherCode);
+  const mapped = code === 149 ? { description: "\u973E", icon: "50d" } : [182, 317, 320, 362, 365].includes(code) ? { description: "\u96E8\u5939\u96EA", icon: "13d" } : [392, 395].includes(code) ? { description: "\u96F7\u9635\u96EA", icon: "13d" } : WMO_WEATHER_CODES[WWO_TO_WMO[code]];
+  const description = current.lang_zh?.[0]?.value || current.lang_xx?.[0]?.value || current.weatherDesc?.[0]?.value;
+  return {
+    temp: Math.round(temp),
+    feelsLike: Math.round(feelsLike),
+    humidity: Math.round(humidity),
+    description: mapped?.description || (typeof description === "string" ? description.trim().slice(0, 80) : "") || "\u672A\u77E5",
+    icon: mapped?.icon || "01d",
+    // nearest_area 是气象站附近的地名，不一定是用户填写的城市（如成都返回郫县）。
+    city
+  };
+};
+var fetchWeatherFromSource = async (city, source, apiKey = "", timeoutMs = WEATHER_REQUEST_TIMEOUT_MS) => {
+  if (!city.trim()) throw new Error("\u8BF7\u5148\u586B\u5199\u57CE\u5E02");
+  const data = source === "owm" ? await fetchOwmWeather(city, apiKey, timeoutMs) : source === "wttr" ? await fetchWttrWeather(city, timeoutMs) : await fetchOpenMeteoWeather(city, timeoutMs);
+  return { ...data, source };
+};
+var fetchWeatherOrThrow = async (city, apiKey, freeSource) => {
+  city = city.trim();
+  if (!city) throw new Error("\u8BF7\u5148\u586B\u5199\u57CE\u5E02");
+  const key = apiKey?.trim() || "";
+  const preferred = normalizeFreeWeatherSource(freeSource);
+  const sources = [...key ? ["owm"] : [], preferred, preferred === "wttr" ? "open-meteo" : "wttr"];
+  const failures = [];
+  for (const source of sources) {
     try {
-      return await fetchOwmWeather(city, apiKey);
-    } catch (e) {
-      console.warn("OpenWeatherMap \u5931\u8D25\uFF0C\u56DE\u843D Open-Meteo:", e);
+      const weather = await fetchWeatherFromSource(city, source, key, key ? 3e3 : 4e3);
+      return failures.length ? { ...weather, fallbackFrom: sources[0] } : weather;
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : `${WEATHER_SOURCE_LABELS[source]}\u8FDE\u63A5\u5931\u8D25`);
     }
   }
+  throw new Error(failures.join("\uFF1B"));
+};
+var fetchWeatherWithFallback = async (city, apiKey, freeSource) => {
+  city = city.trim();
+  apiKey = apiKey?.trim();
+  if (!city) return null;
   try {
-    return await fetchOpenMeteoWeather(city);
+    return await fetchWeatherOrThrow(city, apiKey, freeSource);
   } catch (e) {
     console.error("Failed to fetch weather:", e);
     return null;
@@ -15281,24 +15539,26 @@ var withBudget = async (job, ms, fallback, label) => {
 var loadWeather = async (cfg, nowMs, globalRows, pendingWrites) => {
   const city = cfg.weatherCity?.trim();
   if (!city) return null;
+  const freeSource = normalizeFreeWeatherSource(cfg.weatherFreeSource);
   const snap = parseSnapshot(
     globalRows,
     AMSG_WEATHER_SNAPSHOT_KEY,
     (v) => v && typeof v.city === "string" && v.data && typeof v.fetchedAt === "number"
   );
-  if (snap && snap.city === city && nowMs - snap.fetchedAt < WEATHER_TTL_MS) {
+  const matches = snap && snap.city === city && normalizeFreeWeatherSource(snap.freeSource) === freeSource;
+  if (matches && nowMs - snap.fetchedAt < WEATHER_TTL_MS) {
     console.log("[amsg:world] \u5929\u6C14\u547D\u4E2D\u5FEB\u7167", { city, ageMin: Math.round((nowMs - snap.fetchedAt) / 6e4) });
     return snap.data;
   }
-  const fresh = await fetchWeatherWithFallback(city, cfg.weatherApiKey);
+  const fresh = await fetchWeatherWithFallback(city, cfg.weatherApiKey, freeSource);
   if (fresh) {
     pendingWrites.push({
       key: AMSG_WEATHER_SNAPSHOT_KEY,
-      value: JSON.stringify({ city, data: fresh, fetchedAt: nowMs })
+      value: JSON.stringify({ city, freeSource, data: fresh, fetchedAt: nowMs })
     });
     return fresh;
   }
-  if (snap && snap.city === city && nowMs - snap.fetchedAt <= WEATHER_FALLBACK_MAX_AGE_MS) {
+  if (matches && nowMs - snap.fetchedAt <= WEATHER_FALLBACK_MAX_AGE_MS) {
     console.warn("[amsg:world] \u5929\u6C14\u62C9\u53D6\u5931\u8D25\uFF0C\u5148\u7528\u4E0A\u4E00\u6B21\u7684\u8BFB\u6570", { city });
     return snap.data;
   }
@@ -16869,6 +17129,36 @@ var classifyFetchFailure = (ctx) => {
   return "unknown";
 };
 
+// utils/xhsNoteLink.ts
+function buildXhsNoteLink(note, mobile = false) {
+  const id = note.noteId || note.note_id || note.id;
+  if (!id || !/^[a-f\d]{24}$/i.test(id)) return;
+  let original;
+  for (const value of [note.url, note.shareUrl]) {
+    if (!value) continue;
+    try {
+      const candidate = new URL(value);
+      if (/^https?:$/.test(candidate.protocol) && !candidate.username && !candidate.password && ["xiaohongshu.com", "www.xiaohongshu.com", "rednote.com", "www.rednote.com"].includes(candidate.hostname) && candidate.pathname.match(/^\/(?:explore|discovery\/item|search_result)\/([a-f\d]{24})\/?$/i)?.[1] === id) {
+        original = candidate;
+        break;
+      }
+    } catch {
+    }
+  }
+  const host = original?.hostname || (note.platform === "rednote" ? "www.rednote.com" : "www.xiaohongshu.com");
+  const url = original || new URL(`https://${host}/explore/${id}`);
+  url.protocol = "https:";
+  url.port = "";
+  if (mobile) url.pathname = `/discovery/item/${id}`;
+  const token = note.xsecToken || note.xsec_token || url.searchParams.get("xsec_token");
+  const source = note.xsecSource || note.xsec_source || url.searchParams.get("xsec_source");
+  if (token) {
+    url.searchParams.set("xsec_token", token);
+    url.searchParams.set("xsec_source", source || "pc_feed");
+  }
+  return url.href;
+}
+
 // utils/xhsMcpClient.ts
 var XHS_SPIDER_V3_EXPERIMENT = Object.freeze({
   optInValue: "spider-v3-isolated-cookie",
@@ -17422,7 +17712,11 @@ var XhsMcpClient = {
   },
   search: async (serverUrl, keyword, options, signal) => {
     signal?.throwIfAborted();
-    return detectMode(serverUrl) === "bridge" ? bridgePost(serverUrl, "search", { keyword, ...options }, signal) : mcpCallTool(serverUrl, "search", { keyword }, signal);
+    const result = await (detectMode(serverUrl) === "bridge" ? bridgePost(serverUrl, "search", { keyword, ...options }, signal) : mcpCallTool(serverUrl, "search", { keyword }, signal));
+    if (result.success) for (const note of extractNotesFromMcpData(result.data)) {
+      if (note && typeof note === "object" && !note.xsecSource && !note.xsec_source && !note.url && !note.note_url && !note.shareUrl && !note.share_url) note.xsecSource = "pc_search";
+    }
+    return result;
   },
   getRecommend: async (serverUrl, signal) => {
     signal?.throwIfAborted();
@@ -17677,8 +17971,20 @@ var normalizeNote = (n) => {
   const collectsRaw = n.collects ?? n.collected_count ?? interact.collected_count ?? interact.collectedCount ?? 0;
   const commentCountRaw = n.commentCount ?? n.comment_count ?? interact.comment_count ?? interact.commentCount ?? 0;
   const shareCountRaw = n.shareCount ?? n.share_count ?? interact.share_count ?? interact.shareCount ?? 0;
+  const noteId = n.noteId || n.note_id || n.id || card?.note_id || card?.noteId || "";
+  const platform = n.platform === "rednote" || n.platform === "xhs" ? n.platform : litePlatform === "rednote" ? "rednote" : "xhs";
+  const xsecToken = n.xsecToken || n.xsec_token || card?.xsec_token || card?.xsecToken || void 0;
+  const xsecSource = n.xsecSource || n.xsec_source || card?.xsec_source || card?.xsecSource || void 0;
+  const url = buildXhsNoteLink({
+    noteId,
+    platform,
+    xsecToken,
+    xsecSource,
+    url: n.url || n.note_url,
+    shareUrl: n.shareUrl || n.share_url || card?.share_url
+  });
   return {
-    noteId: n.noteId || n.note_id || n.id || card?.note_id || card?.noteId || card?.noteId || "",
+    noteId,
     title: n.title || n.display_title || n.displayTitle || card?.display_title || card?.displayTitle || "",
     desc: (n.desc || n.description || n.content || card?.desc || card?.description || card?.title || "").slice(0, 500),
     author: n.author || n.nickname || n.user?.nickname || n.user?.name || card?.user?.nickname || card?.user?.name || "",
@@ -17687,7 +17993,10 @@ var normalizeNote = (n) => {
     collects: parseXhsCount(collectsRaw),
     commentCount: parseXhsCount(commentCountRaw),
     shareCount: parseXhsCount(shareCountRaw),
-    xsecToken: n.xsecToken || n.xsec_token || card?.xsec_token || card?.xsecToken || void 0,
+    xsecToken,
+    xsecSource,
+    url,
+    platform,
     coverUrl,
     type: n.type || card?.type || void 0
   };
@@ -18108,6 +18417,8 @@ async function runXhsDetail(args, ctx) {
         author: detailNote.author || matched?.author || "",
         authorId: detailNote.authorId || matched?.authorId || "",
         xsecToken: detailNote.xsecToken || detailToken || xsecToken || matched?.xsecToken,
+        url: matched?.url || detailNote.url,
+        xsecSource: matched?.xsecSource || detailNote.xsecSource,
         comments: detailNote.comments || matched?.comments
       };
       const index = ctx.lastXhsNotesRef.current.findIndex((n) => n.noteId === args.noteId);
@@ -18246,6 +18557,12 @@ async function dispatchAgenticTool(toolName, args, ctx) {
       throw new Error(`Unknown agentic tool: ${toolName}`);
   }
 }
+
+// utils/replyScope.ts
+var buildReplyScopeRule = (trigger) => {
+  const start = trigger === "user" ? "\u4ECE\u7528\u6237\u6700\u65B0\u53D1\u6765\u7684\u90A3\u6761\u6D88\u606F\u5F00\u59CB" : "\u4ECE\u4F60\u6536\u5230\u8FD9\u4EFD\u8BF4\u660E\u5F00\u59CB\uFF08\u4F60\u4E4B\u524D\u5B89\u6392\u7684\u4E3B\u52A8\u6D88\u606F\u5230\u70B9\u4E86\uFF09";
+  return `[\u8FD9\u6B21\u56DE\u590D\u7684\u8303\u56F4\uFF1A${start}\uFF0C\u5230\u4F60\u7ED9\u51FA\u4E00\u6761\u4E0D\u518D\u8C03\u7528\u5DE5\u5177\u7684\u6B63\u6587\u4E3A\u6B62\u3002\u8FD9\u671F\u95F4\u4F60\u6BCF\u8C03\u7528\u4E00\u6B21\u5DE5\u5177\u3001\u62FF\u5230\u4E00\u6B21\u7ED3\u679C\uFF0C\u90FD\u53EA\u662F\u8FD9\u6B21\u56DE\u590D\u91CC\u7684\u4E00\u6B65\uFF0C\u4E0D\u662F\u65B0\u7684\u4E00\u6B21\uFF1B\u4F60\u5728\u8FD9\u671F\u95F4\u5199\u4E0B\u7684\u8BDD\u90FD\u7B97\u8FD9\u6B21\u56DE\u590D\u7684\u4E00\u90E8\u5206\uFF0C\u540E\u9762\u4E0D\u5FC5\u91CD\u590D\u3002]`;
+};
 
 // utils/agenticToolFeedback.ts
 var toolCallFingerprint = (name, args) => {
@@ -18413,15 +18730,23 @@ var requestEmotionEval = async (api, promptContent, timeoutMs = EMOTION_EVAL_TIM
       return { raw: null, error: `\u526F API HTTP ${res.status}${snippet ? `\uFF1A${snippet}` : ""}` };
     }
     const data = await res.json();
+    const rawUsage = data?.usage;
+    const promptTokens = typeof rawUsage?.prompt_tokens === "number" && Number.isFinite(rawUsage.prompt_tokens) ? rawUsage.prompt_tokens : void 0;
+    const completionTokens = typeof rawUsage?.completion_tokens === "number" && Number.isFinite(rawUsage.completion_tokens) ? rawUsage.completion_tokens : void 0;
+    const usage = promptTokens !== void 0 || completionTokens !== void 0 ? {
+      ...promptTokens !== void 0 ? { promptTokens } : {},
+      ...completionTokens !== void 0 ? { completionTokens } : {}
+    } : void 0;
     const message = data?.choices?.[0]?.message;
     const raw = flattenEvalContent(message?.content) || (typeof message?.reasoning_content === "string" ? message.reasoning_content : "");
     if (!raw.trim()) {
       return {
         raw: null,
-        error: `\u8BC4\u4F30\u6A21\u578B\u6CA1\u6709\u8F93\u51FA\u5185\u5BB9\uFF08finish_reason: ${data?.choices?.[0]?.finish_reason ?? "?"}\uFF09`
+        error: `\u8BC4\u4F30\u6A21\u578B\u6CA1\u6709\u8F93\u51FA\u5185\u5BB9\uFF08finish_reason: ${data?.choices?.[0]?.finish_reason ?? "?"}\uFF09`,
+        ...usage ? { usage } : {}
       };
     }
-    return { raw, error: null };
+    return { raw, error: null, ...usage ? { usage } : {} };
   } catch (error) {
     if (signal?.aborted) return { raw: null, error: null };
     console.warn("[emotion-eval] \u8BC4\u4F30\u5931\u8D25\uFF08\u4E3B\u6D41\u7A0B\u4E0D\u53D7\u5F71\u54CD\uFF09", error);
@@ -18797,6 +19122,9 @@ var isFcmConfigured = (env) => Boolean(
 installAnthropicFetch(false);
 var getFireStash = (scratch) => scratch?.fire;
 var REPLY_IN_FLIGHT_DEFER_MS = 45e3;
+var AWAY_DUE_TOLERANCE_MS = 6e4;
+var AWAY_MAX_DEFER_MS = 24 * 60 * 6e4;
+var DATE_LEAVE_DUE_TOLERANCE_MS = 5e3;
 var laterOf = (a, b) => a == null ? b : b == null ? a : Math.max(a, b);
 var buildToolCtx = (pack, config) => {
   const char = {
@@ -18831,16 +19159,6 @@ var fireStateError = (reason, detail) => {
   const error = new Error(`AMSG2_FIRE_STATE_MISSING: ${reason}`);
   error.permanent = true;
   return error;
-};
-var INLINE_THINK_RE = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/gi;
-var extractInlineThink = (text2) => {
-  if (!text2.includes("<")) return "";
-  const blocks = [];
-  for (const match of text2.matchAll(INLINE_THINK_RE)) {
-    const inner = match[2].trim();
-    if (inner) blocks.push(inner);
-  }
-  return blocks.join("\n\n");
 };
 var amsgReasoningKey = (clientTaskId) => `reasoning:${clientTaskId}`;
 var pushFits = (payload) => measurePushPayload(JSON.stringify(payload), { reserveEnvelope: true }).withinLimit;
@@ -18931,8 +19249,19 @@ var writeLastSkip = async (writeState, charId, skip) => {
     console.warn("[amsg:skip] \u8DF3\u8FC7\u539F\u56E0\u5199\u5165\u5931\u8D25\uFF08\u8DF3\u8FC7\u672C\u8EAB\u7167\u5E38\u751F\u6548\uFF0C\u53EA\u662F\u9762\u677F\u5C11\u4E00\u53E5\u8BF4\u660E\uFF09", error);
   }
 };
+var proactiveKindOf = (stash) => stash.away ? "away" : stash.dateLeave ? "dateLeave" : stash.selfScheduled ? "self" : "scheduled";
+var readStashUsage = (stash) => {
+  const pt = stash.promptTokensAcc;
+  const ct = stash.completionTokensAcc;
+  if (pt === void 0 && ct === void 0) return void 0;
+  return {
+    ...pt !== void 0 ? { promptTokens: pt } : {},
+    ...ct !== void 0 ? { completionTokens: ct } : {}
+  };
+};
+var hasPartialStashUsage = (stash) => (stash.llmRounds ?? 0) > (stash.llmRoundsWithUsage ?? 0);
 var emitFireSkip = async (emitResult, args) => {
-  if (!args.taskUuid || !shouldReportFireSkip(args.reason) || typeof emitResult !== "function") return;
+  if (!args.taskUuid || !shouldReportFireSkip(args.reason) && !args.usage || typeof emitResult !== "function") return;
   try {
     await emitResult({
       ...buildFireSkipResult({ ...args, taskUuid: args.taskUuid }),
@@ -19559,6 +19888,8 @@ var amsgHooks = {
     const taskMeta = ctx.task.metadata ?? {};
     const taskPolicy = typeof taskMeta.amsgExpirePolicy === "string" ? taskMeta.amsgExpirePolicy : void 0;
     const selfScheduled = taskMeta.amsgSelfScheduled === true;
+    const away = taskMeta[AMSG_AWAY_MESSAGE_META] === true;
+    const dateLeave = taskMeta[AMSG_DATE_LEAVE_META] === true;
     const recurring = ctx.task.recurrenceType === "daily" || ctx.task.recurrenceType === "weekly";
     const emotionEvalSpec = takeEmotionEvalSpec(ctx.task.metadata);
     const taskKind = readTaskKind(taskMeta);
@@ -19590,7 +19921,8 @@ var amsgHooks = {
     const presence = parseAmsgChatPresence(
       charRows.find((r) => r.key === AMSG_CHAT_PRESENCE_KEY)?.value
     );
-    if (!instant && policy === "expire" && isFreshChatPresence(presence, charId, ctx.now.getTime())) {
+    const inPerson = presence?.scene === "date" && isFreshChatPresence(presence, charId, ctx.now.getTime());
+    if (!instant && policy === "expire" && !inPerson && isFreshChatPresence(presence, charId, ctx.now.getTime())) {
       console.log("[amsg:defer]", {
         taskId: ctx.task.id,
         reason: "reply-in-flight",
@@ -19657,6 +19989,8 @@ var amsgHooks = {
     }
     const presenceLastUserMessageAt = presence?.charId === charId ? presence.lastUserMessageAt : null;
     const lastUserMessageAt = laterOf(pack.lastUserMessageAt ?? null, presenceLastUserMessageAt);
+    const lastInteractionAt = laterOf(pack.lastAwayAnchorAt ?? null, lastUserMessageAt);
+    const awayAnchorAt = laterOf(lastInteractionAt, inPerson && presence ? presence.activeAt : null);
     if (!instant) {
       console.log("[amsg:fire-context]", {
         taskId: ctx.task.id,
@@ -19665,8 +19999,30 @@ var amsgHooks = {
         occurrenceMs,
         nowMs: ctx.now.getTime(),
         packLastUserMessageAt: pack.lastUserMessageAt ?? null,
+        packLastAwayAnchorAt: pack.lastAwayAnchorAt ?? null,
         presenceLastUserMessageAt
       });
+    }
+    if (!instant && dateLeave && presence?.charId === charId) {
+      if (presence.scene !== "date") {
+        console.log("[amsg:date-leave-returned]", { taskId: ctx.task.id, charId, presenceActiveAt: presence.activeAt });
+        return { skip: true };
+      }
+      const dueAt = presence.activeAt + Number(taskMeta[AMSG_DATE_LEAVE_DELAY_META]) * 6e4;
+      const waitMs = Number.isFinite(dueAt) ? dueAt - ctx.now.getTime() : 0;
+      if (waitMs > DATE_LEAVE_DUE_TOLERANCE_MS) {
+        console.log("[amsg:defer]", { taskId: ctx.task.id, reason: "date-leave-not-due", dueAt });
+        return { defer: { afterMs: Math.min(waitMs, AWAY_MAX_DEFER_MS) } };
+      }
+    }
+    if (!instant && away) {
+      const delayMs = Number(taskMeta[AMSG_AWAY_DELAY_META]) * 6e4;
+      const dueAt = awayAnchorAt != null && delayMs > 0 ? awayAnchorAt + delayMs : null;
+      const waitMs = dueAt == null ? 0 : dueAt - ctx.now.getTime();
+      if (waitMs > AWAY_DUE_TOLERANCE_MS) {
+        console.log("[amsg:defer]", { taskId: ctx.task.id, reason: "away-not-due", dueAt });
+        return { defer: { afterMs: Math.min(waitMs, AWAY_MAX_DEFER_MS) } };
+      }
     }
     if (!instant && typeof taskMeta.amsgTaskInstruction !== "string") {
       throw fail3("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
@@ -19701,7 +20057,7 @@ var amsgHooks = {
       ctx.now.getTime(),
       typeof ctx.task.uuid === "string" && ctx.task.uuid ? stoppedReplyKey(ctx.task.uuid) : null
     );
-    const selfLog = reconcileSelfLogWithPack(storedSelfLog, pack, lastUserMessageAt);
+    const selfLog = reconcileSelfLogWithPack(storedSelfLog, pack, lastInteractionAt);
     const taskBrief = findTaskBrief([...pack.pendingTasks, ...selfLog.tasks], ctx.task.uuid);
     const clientTaskId = typeof taskMeta.amsgClientTaskId === "string" ? taskMeta.amsgClientTaskId : "";
     const nowMs = ctx.now.getTime();
@@ -19717,8 +20073,13 @@ var amsgHooks = {
       await recordSkip(ctx, charId, "schedule-off", occurrenceMs, taskBrief);
       return { skip: true };
     }
+    if (!instant && policy === "expire" && inPerson) {
+      console.log("[amsg:in-person-skip]", { taskId: ctx.task.id, charId });
+      await recordSkip(ctx, charId, "in-person", occurrenceMs, taskBrief);
+      return { skip: true };
+    }
     const maxUnansweredSends = limits.maxUnansweredSends;
-    if (!instant && selfScheduled && countUnansweredSends(selfLog) >= maxUnansweredSends) {
+    if (!instant && (selfScheduled || away) && countUnansweredSends(selfLog) >= maxUnansweredSends) {
       console.log("[amsg:unanswered-limit-skip]", {
         taskId: ctx.task.id,
         charId,
@@ -19753,7 +20114,7 @@ var amsgHooks = {
     const dailyDay = dayKeyInZone(nowMs, pack.userTzId);
     const dailySends = parseDailySends(charRows.find((r) => r.key === AMSG_DAILY_SENDS_KEY)?.value);
     const sentToday = sendsOnDay(dailySends, dailyDay);
-    if (!instant && sentToday >= limits.dailySendCap) {
+    if (!instant && !dateLeave && sentToday >= limits.dailySendCap) {
       console.log("[amsg:daily-limit-skip]", {
         taskId: ctx.task.id,
         charId,
@@ -19794,7 +20155,7 @@ var amsgHooks = {
       livePendingTasks = live;
     }
     const otherLiveTasks = livePendingTasks.filter((t) => recurring || t.taskUuid !== ctx.task.uuid && (!clientTaskId || t.clientTaskId !== clientTaskId));
-    const selfScheduleAllowed = !scheduleOff;
+    const selfScheduleAllowed = !scheduleOff && !dateLeave;
     const canSelfSchedule = typeof ctx.scheduleTask === "function" && selfScheduleAllowed;
     const tz = { tzId: pack.tzId };
     const { toolCtx, proxyWorkerUrl, xhsCookie } = buildToolCtx(toolPack, toolConfig);
@@ -19845,10 +20206,15 @@ var amsgHooks = {
       // （resolveFireSceneSong 与 renderFireSceneBlock 共用判定），冻的必然是正文里那首。
       sceneSong: resolveFireSceneSong(pack.scene, ctx.now.getTime(), tz),
       instant,
+      // 见面离开提醒也查：生成期间回到见面或开了口，人已经回来了，这条就不发。
+      overlapGuard: !instant && (policy === "expire" || dateLeave) ? { lastUserMessageAt } : null,
       instantInputKey,
       // 下面即时对话那一支起跑（要等请求消息拼完才知道给评估喂什么）。
       emotionEvalPromise: null,
-      emotionLatePending: false
+      emotionLatePending: false,
+      away,
+      dateLeave,
+      selfScheduled
     };
     ctx.scratch.fire = stash;
     const canManageTasks = canSelfSchedule && mcpNative && typeof ctx.cancelTask === "function" && typeof ctx.renewTask === "function";
@@ -19900,6 +20266,9 @@ var amsgHooks = {
       ...canSelfSchedule && mcpNative ? [buildFireScheduleTool({ nowMs: ctx.now.getTime(), tz, abilities, context: instant ? "chat" : "fire" })] : [],
       ...canManageTasks && mcpNative ? [buildFireCancelTool(), buildFireRenewTool({ nowMs: ctx.now.getTime(), tz })] : []
     ];
+    const replyScopeBlock = fireTools.length > 0 || mcpBlock || scheduleBlock ? `
+${buildReplyScopeRule(instant ? "user" : "scheduled")}
+` : "";
     stash.fireToolNames = new Set(fireTools.map((t) => t?.function?.name).filter((n) => typeof n === "string" && !n.startsWith(MCP_FIRE_NAME_PREFIX)));
     stash.allowedToolNames = /* @__PURE__ */ new Set([
       ...DATA_TOOL_NAMES,
@@ -19924,7 +20293,8 @@ var amsgHooks = {
           renderSelfLogBlock(selfLog, ctx.now.getTime(), tz, maxUnansweredSends),
           taskListBlock,
           mcpBlock,
-          scheduleBlock
+          scheduleBlock,
+          replyScopeBlock
         ]
       });
       const chatMessages = pack.chat.messages;
@@ -19981,11 +20351,12 @@ ${userHoliday}` });
       selfLog,
       taskListBlock,
       realtimeWorldBlock,
-      lastUserMessageAt,
+      lastUserMessageAt: lastInteractionAt,
       // 「此刻在做什么」里的钟点跟今日节日同一个开关：关掉时间感知的角色不该从日程块
       // 读到「23:00」——那正是这个开关要挡的东西。日程内容本身照给。
-      includeClock: toolPack.timeAwarenessEnabled
-    }), userHoliday) + mcpBlock + scheduleBlock;
+      includeClock: toolPack.timeAwarenessEnabled,
+      mustSpeak: away || dateLeave
+    }), userHoliday) + mcpBlock + scheduleBlock + replyScopeBlock;
     return {
       messages: [{ role: "user", content: prompt }],
       ...common
@@ -20001,7 +20372,9 @@ ${userHoliday}` });
       }
       return handler.llmOutput({ ctx, state: kindFire.state });
     }
-    const content = stripReasoningTags(ctx.llmOutputText || "").trim();
+    const llmMessage = ctx.llmResponse?.choices?.[0]?.message;
+    const rawContent = llmMessage && "content" in llmMessage ? readAssistantMessage(llmMessage).content : ctx.llmOutputText || "";
+    const content = splitInlineThinking(rawContent).content.trim();
     const taskId = ctx.taskId != null ? String(ctx.taskId) : null;
     if (taskId == null) {
       console.warn("[amsg:agentic] ctx \u4E0A\u6CA1\u6709 taskId\uFF0C\u9001\u8FBE\u5F52\u5C5E\u4F1A\u5931\u6548", ctx.sessionId);
@@ -20012,9 +20385,18 @@ ${userHoliday}` });
       throw new Error("AMSG2_FIRE_STASH_MISSING: onLLMOutput \u8BFB\u4E0D\u5230 ctx.scratch.fire\uFF0C\u68C0\u67E5 amsg-server \u662F\u5426\u4ECD\u5171\u4EAB scratch");
     }
     const session = stash.session;
-    const llmMessage = ctx.llmResponse?.choices?.[0]?.message;
-    const nativeReasoning = llmMessage?.reasoning_content ?? llmMessage?.reasoning ?? llmMessage?.thinking;
-    const roundReasoning = [nativeReasoning, extractInlineThink(ctx.llmOutputText || "")].filter((s) => typeof s === "string" && !!s.trim()).map((s) => s.trim()).join("\n\n");
+    stash.llmRounds = (stash.llmRounds ?? 0) + 1;
+    const roundRawUsage = ctx.usage ?? ctx.llmResponse?.usage;
+    if (roundRawUsage && typeof roundRawUsage === "object") {
+      const pt = typeof roundRawUsage.prompt_tokens === "number" && Number.isFinite(roundRawUsage.prompt_tokens) ? roundRawUsage.prompt_tokens : void 0;
+      const ct = typeof roundRawUsage.completion_tokens === "number" && Number.isFinite(roundRawUsage.completion_tokens) ? roundRawUsage.completion_tokens : void 0;
+      if (pt !== void 0 || ct !== void 0) {
+        stash.llmRoundsWithUsage = (stash.llmRoundsWithUsage ?? 0) + 1;
+        if (pt !== void 0) stash.promptTokensAcc = (stash.promptTokensAcc ?? 0) + pt;
+        if (ct !== void 0) stash.completionTokensAcc = (stash.completionTokensAcc ?? 0) + ct;
+      }
+    }
+    const roundReasoning = readAssistantThinking(llmMessage && "content" in llmMessage ? llmMessage : { ...llmMessage, content: rawContent });
     session.finalReasoning = roundReasoning || null;
     const rawToolCalls = ctx.llmResponse?.choices?.[0]?.message?.tool_calls;
     const nativeCalls = classifyNativeToolCalls(rawToolCalls, stash.fireToolNames, stash.mcpResolve);
@@ -20075,8 +20457,45 @@ ${userHoliday}` });
         pushes: decision.decision === "finish" ? decision.pushPayloads.length : 0
       });
     }
+    if (decision.decision === "finish" && stash.overlapGuard) {
+      const presenceRows = await ctx.readState(amsgStateNamespace(stash.charId), { key: AMSG_CHAT_PRESENCE_KEY });
+      const presence = parseAmsgChatPresence(presenceRows.find((r) => r.key === AMSG_CHAT_PRESENCE_KEY)?.value);
+      if (chattedDuringFire(presence, stash.charId, Date.now(), stash.overlapGuard.lastUserMessageAt)) {
+        const overlapReason = presence?.scene === "date" ? "in-person" : "chat-overlap";
+        if (stash.scheduledTasks.length || stash.cancelledTasks.length || stash.renewedTasks.length) {
+          console.warn("[amsg:chat-overlap] \u751F\u6210\u671F\u95F4\u7528\u6237\u5F00\u53E3\u4E86\uFF0C\u4F46\u8FD9\u8F6E\u6539\u8FC7\u4EFB\u52A1\uFF0C\u7167\u5E38\u53D1\u51FA", { taskId });
+        } else {
+          console.log("[amsg:chat-overlap] \u751F\u6210\u671F\u95F4\u7528\u6237\u5F00\u53E3\u4E86\uFF0C\u8FD9\u6761\u4E0D\u53D1", {
+            taskId,
+            seenLastUserMessageAt: stash.overlapGuard.lastUserMessageAt,
+            presenceLastUserMessageAt: presence?.lastUserMessageAt ?? null
+          });
+          await writeLastSkip(ctx.writeState, stash.charId, {
+            v: 1,
+            taskUuid: stash.taskUuid,
+            occurrenceMs: stash.occurrenceMs,
+            reason: overlapReason,
+            skippedAt: Date.now()
+          });
+          const overlapUsage = readStashUsage(stash);
+          await emitFireSkip(ctx.emitResult, {
+            charId: stash.charId,
+            taskUuid: stash.taskUuid,
+            occurrenceMs: stash.occurrenceMs,
+            reason: overlapReason,
+            task: findTaskBrief(stash.pendingTasks, stash.taskUuid),
+            ...overlapUsage ? {
+              usage: { ...overlapUsage, ...hasPartialStashUsage(stash) ? { tokensPartial: true } : {} },
+              proactiveKind: proactiveKindOf(stash)
+            } : {}
+          });
+          return { decision: "skip-push" };
+        }
+      }
+    }
     if (decision.decision === "skip-push" && decision.sideEffects) {
       if (typeof ctx.emitResult !== "function") throw new Error("AMSG2_RESULT_UNSUPPORTED: \u8BF7\u66F4\u65B0 Worker \u4EE5\u63A5\u6536\u52A8\u4F5C\u7ED3\u679C");
+      const sideEffectUsage = readStashUsage(stash);
       const metadata = {
         ...stripSarSnapshot(stripEmotionEvalSpec(ctx.metadata)),
         ...decision.sideEffects,
@@ -20084,6 +20503,11 @@ ${userHoliday}` });
         ...stash.scheduledTasks.length ? { amsgSelfScheduled: stash.scheduledTasks } : {},
         ...stash.cancelledTasks.length || stash.renewedTasks.length ? {
           amsgTaskMutations: { cancelled: stash.cancelledTasks, renewed: stash.renewedTasks }
+        } : {},
+        ...sideEffectUsage ? {
+          amsgUsage: sideEffectUsage,
+          amsgProactiveKind: proactiveKindOf(stash),
+          ...hasPartialStashUsage(stash) ? { amsgTokensPartial: true } : {}
         } : {}
       };
       await ctx.emitResult({
@@ -20155,12 +20579,17 @@ ${userHoliday}` });
         skippedAt: Date.now()
       });
       if (!stash.instant) {
+        const skipUsage = readStashUsage(stash);
         await emitFireSkip(ctx.emitResult, {
           charId: stash.charId,
           taskUuid: stash.taskUuid,
           occurrenceMs: stash.occurrenceMs,
           reason: decision.reason,
-          task: findTaskBrief(stash.pendingTasks, stash.taskUuid)
+          task: findTaskBrief(stash.pendingTasks, stash.taskUuid),
+          ...skipUsage ? {
+            usage: { ...skipUsage, ...hasPartialStashUsage(stash) ? { tokensPartial: true } : {} },
+            proactiveKind: proactiveKindOf(stash)
+          } : {}
         });
       }
       if (stash.instant && stash.taskUuid && ctx.writeState) {
@@ -20200,16 +20629,11 @@ ${userHoliday}` });
         const lastMeta = {};
         const toolTrace = condenseToolTrace(session.toolCalls);
         if (toolTrace.length > 0) lastMeta.amsgToolTrace = toolTrace;
-        const usage = ctx.usage;
-        if (usage && typeof usage === "object") {
-          const pick = (key) => typeof usage[key] === "number" ? usage[key] : void 0;
-          const promptTokens = pick("prompt_tokens");
-          const completionTokens = pick("completion_tokens");
-          if (promptTokens !== void 0 || completionTokens !== void 0) {
-            lastMeta.amsgUsage = {
-              ...promptTokens !== void 0 ? { promptTokens } : {},
-              ...completionTokens !== void 0 ? { completionTokens } : {}
-            };
+        const stashUsage = readStashUsage(stash);
+        if (stashUsage) {
+          lastMeta.amsgUsage = stashUsage;
+          if ((stash.llmRounds ?? 0) > 1 && !hasPartialStashUsage(stash)) {
+            lastMeta.amsgUsageComplete = true;
           }
         }
         if (stash.emotionEvalPromise) {
@@ -20227,10 +20651,20 @@ ${userHoliday}` });
             lastMeta.amsgEmotionDone = true;
             if (outcome.raw) lastMeta.amsgEmotionUpdate = outcome.raw;
             else if (outcome.error) lastMeta.amsgEmotionError = outcome.error;
+            if (outcome.usage) lastMeta.amsgEmotionUsage = outcome.usage;
           }
         }
         if (Object.keys(lastMeta).length > 0) {
           payloads = attachMetaAt(payloads, payloads.length - 1, lastMeta);
+        }
+      } else if (!stash.instant && payloads.length > 0) {
+        const stashUsage = readStashUsage(stash);
+        if (stashUsage) {
+          payloads = attachMetaAt(payloads, payloads.length - 1, {
+            amsgUsage: stashUsage,
+            amsgProactiveKind: proactiveKindOf(stash),
+            ...hasPartialStashUsage(stash) ? { amsgTokensPartial: true } : {}
+          });
         }
       }
       if (stash.charId) {

@@ -6,6 +6,14 @@ import { ackStoppedReplyReceipts, stoppedReplyStateEntries } from './amsgStopped
 import { loadCharacterContextMessages } from './chatContextRange';
 import { ReiClient, classifyClientStateWrite } from '@rei-standard/amsg-client';
 import { createCloudDataSession } from './amsgCloudData';
+import {
+  createAmsgGlobalDisabledError,
+  isAmsg2GloballyEnabled,
+  isAmsg2WorkerActive,
+  readMasterPausedCron,
+  writeMasterPausedCron,
+} from './amsgGlobalGate';
+import { resolveWorkerFetchBase } from './amsgRelay';
 import { captureCloudOwnerGenerations, rememberCloudOwnerGeneration, stampCloudWrite, captureCloudWriteCheck, invalidateCloudOwnerWrites } from './amsgCloudOwnerGeneration';
 import {
   ActiveMsg2CharacterConfig,
@@ -23,10 +31,11 @@ import {
   UserProfile,
 } from '../types';
 import { getLastRealUserMessageAt } from './amsg2ExpireGuard';
-import { AMSG_BUNDLE_VERSION } from './amsgBundleVersion';
+import { getLastAwayAnchorAt } from './awayMessageCore';
+import { AMSG_BUNDLE_VERSION, compareBundleVersions } from './amsgBundleVersion';
 import { describeD1LimitCode } from './amsgD1Limits';
 import { explainCfTokenRejection, parseAmsgSelfUpdateState, type AmsgSelfUpdateReport } from './amsgSelfUpdateState';
-import { buildTaskInstruction, resolveSendAtMs } from './amsgFireSchedule';
+import { AMSG_AWAY_DELAY_META, AMSG_AWAY_MESSAGE_META, AMSG_DATE_LEAVE_META, AMSG_DATE_LEAVE_DELAY_META, buildAwayTaskInstruction, buildDateLeaveInstruction, buildTaskInstruction, resolveSendAtMs } from './amsgFireSchedule';
 import {
   getPendingTasks, isAmsg2EnabledForChar,
   parseRemoteTaskLastError, RemoteTaskLastError, type RemoteTaskProjection,
@@ -218,13 +227,11 @@ const REMOTE_TASK_NOT_FOUND_CODE = 'TASK_NOT_FOUND';
 /** 行还在、但已经跑完出清（sent / failed）时回的错误码（HTTP 409）。 */
 const REMOTE_TASK_ALREADY_COMPLETED_CODE = 'TASK_ALREADY_COMPLETED';
 
-// 单用户模式：所有请求打到用户自部署的 Cloudflare Worker（config.workerUrl）。
+// 单用户模式：所有请求打到用户自部署的 Cloudflare Worker（config.workerUrl），开了中转就经中转转发。
 // 配了 serverToken 就每次带 X-Client-Token；worker 端配了就强制校验，缺/错回 401。
-const normalizeWorkerBase = (workerUrl: string) => workerUrl.trim().replace(/\/+$/, '');
-
-const createClient = (config: Pick<ActiveMsg2GlobalConfig, 'userId' | 'workerUrl' | 'serverToken'>) => {
+const createClient = (config: Pick<ActiveMsg2GlobalConfig, 'userId' | 'workerUrl' | 'serverToken' | 'useRelay' | 'relayToken'>) => {
   const client = new ReiClient({
-    baseUrl: normalizeWorkerBase(config.workerUrl),
+    baseUrl: resolveWorkerFetchBase(config.workerUrl, config.useRelay, config.relayToken),
     userId: config.userId,
     serverToken: config.serverToken || undefined,
   });
@@ -352,7 +359,7 @@ export const fetchWorkerDiagnostics = async (): Promise<AmsgDiagnosticsProbe> =>
     return {
       reachable: false,
       unsupported: true,
-      reason: 'Worker 上跑的代码还没有体检端点。回你 fork 的 sullyos-workers 点一下 Sync fork，或者用上面的「更新 Worker」，之后再来看。',
+      reason: 'Worker 上跑的代码还没有体检端点。点一下上面的「更新 Worker」，之后再来看。',
     };
   } catch (error: any) {
     // fetchWithAuthRaw 抛出来的已经是人话了（见 amsgDiagnostics 的 describeAmsgFetchFailure）。
@@ -399,7 +406,8 @@ export const fetchWorkerTickReport = async (): Promise<AmsgTickReportResult> => 
 
 /** probeWorkerVersion 的回执：版本对不对，外加那台 Worker 自动更新的近况。 */
 export interface AmsgWorkerVersionProbe {
-  state: 'current' | 'outdated' | 'unknown';
+  /** ahead = Worker 比 App 新：App 还是缓存的旧构建，刷新页面就对上了，不该去更新 Worker。 */
+  state: 'current' | 'outdated' | 'ahead' | 'unknown';
   /** 那台 Worker 自报的版本；老 bundle 不报就是 null。 */
   deployed: string | null;
   /** 本 App 期望的版本，用来在界面上写「更新到 X」。 */
@@ -478,10 +486,13 @@ const ensureGlobalReady = async (): Promise<ActiveMsg2GlobalConfig> => {
   return { ...config, userId };
 };
 
-const ensureWorkerReady = async () => {
+const ensureWorkerReady = async (options?: { allowWhenDisabled?: boolean }) => {
   const config = await ensureGlobalReady();
   if (!config.workerUrl.trim()) {
     throw withFailKind(new Error('请先在系统设置里填写「主动消息 2.0」的 Worker 地址。'), '地址没填');
+  }
+  if (!options?.allowWhenDisabled && !isAmsg2GloballyEnabled(config)) {
+    throw createAmsgGlobalDisabledError();
   }
   return config;
 };
@@ -569,7 +580,8 @@ const createAndInitClient = async (config: ActiveMsg2GlobalConfig) => {
 };
 
 const initializeClient = (config: ActiveMsg2GlobalConfig) => {
-  const key = `${config.workerUrl}|${config.userId}|${config.serverToken ?? ''}`;
+  // 实际请求地址进键：中转开关或令牌一变，就换一条按新地址发请求的 client
+  const key = `${config.workerUrl}|${config.userId}|${config.serverToken ?? ''}|${resolveWorkerFetchBase(config.workerUrl, config.useRelay, config.relayToken)}`;
   if (cachedClientEntry?.key === key) return cachedClientEntry.promise;
   const promise = createAndInitClient(config);
   cachedClientEntry = { key, promise };
@@ -637,6 +649,7 @@ export const isLlmCredentialsReady = async (): Promise<boolean> => {
 export const requireAnthropicWorker = async (urls: string[]): Promise<void> => {
   if (!urls.some(isAnthropicEndpoint)) return;
   let config = await ActiveMsgStore.getGlobalConfig();
+  if (!isAmsg2GloballyEnabled(config)) throw createAmsgGlobalDisabledError();
   if (config.anthropicMessagesSupported === true && config.anthropicMessagesWorkerUrl === config.workerUrl) return;
   // An automatic deployment can finish after the startup probe. Recheck the
   // current Worker instead of making users reconnect to clear a stale negative.
@@ -714,12 +727,15 @@ const formatHistoryLine =(role: string, content: any, char: CharacterProfile, us
 };
 
 const buildTimeGapHint = async (charId: string) => {
-  const recentMessages = await DB.getRecentMessagesByCharId(charId, 200);
+  // includeProcessed=true：最近的互动刚被自动归档进记忆宫殿时，锚点时间戳也不能丢。
+  const recentMessages = await DB.getRecentMessagesByCharId(charId, 200, true);
   return {
     // 时间差在渲染时刻才算（formatTimeSinceUser），这里只取原始时间戳——
     // 满血链路会把它放进 fire_pack，worker 到点用「fire 时刻」重算，不吃排程时的陈旧值。
-    // 「真实用户消息」判定与防穿帮闸共用同一叶子 helper（见 amsg2ExpireGuard）。
+    // 「真实用户消息」判定与防穿帮闸共用同一叶子 helper（见 amsg2ExpireGuard）；
+    // lastAwayAnchorAt 额外把线下见面与实时通话记录算进在场起点（见 awayMessageCore）。
     lastUserMessageAt: getLastRealUserMessageAt(recentMessages),
+    lastAwayAnchorAt: getLastAwayAnchorAt(recentMessages),
     recentMessages,
   };
 };
@@ -781,7 +797,7 @@ export const buildFirePack = async (
     const { buildRoomPlatesInjection } = await import('./memoryPalace/roomPlates');
     char.roomPlatesInjection = await buildRoomPlatesInjection(char.id, userProfile.name);
   }
-  const [{ lastUserMessageAt }, recentMessages, library, schedule] = await Promise.all([
+  const [{ lastUserMessageAt, lastAwayAnchorAt }, recentMessages, library, schedule] = await Promise.all([
     buildTimeGapHint(char.id),
     templateStub ? Promise.resolve([]) : loadCharacterContextMessages(char),
     // 表情库只喂系统提示词/近史渲染：占位模板路径整库都不用读（表情记录带图片数据，
@@ -943,6 +959,7 @@ export const buildFirePack = async (
     template,
     thinkingChainEnabled: outputStyle.thinkingActive,
     lastUserMessageAt,
+    lastAwayAnchorAt,
     // 角色的时间参照系（见上面的 tzId / userTzId）：前者是角色自己的钟，后者是用户那边的，
     // worker 渲染时两者各管各的一行，绝不混用。
     tzId,
@@ -1295,7 +1312,7 @@ export const describeInstantChatFailure = (status: number, body: any): string =>
     return '即时对话没发出去：共享密钥和 Worker 上的对不上，去「主动消息 2.0」设置里核对一下。';
   }
   if (status === 405 || status === 404) {
-    return '即时对话没发出去：Worker 上还没有这个端点，去你 fork 的 sullyos-workers 点一下 Sync fork 更新。';
+    return '即时对话没发出去：Worker 上还没有这个端点，去「设置 → 主动消息 2.0」点一下「更新 Worker」。';
   }
   if (status === 503) {
     if (code === 'INSTANT_CHAT_WORKER_OUTDATED' && outerMessage) {
@@ -1855,7 +1872,7 @@ const fetchWithAuthRaw = async (
   if (gzipped) headers.set('Content-Encoding', 'gzip');
 
   try {
-    const response = await fetch(`${normalizeWorkerBase(config.workerUrl)}/${path}`, {
+    const response = await fetch(`${resolveWorkerFetchBase(config.workerUrl, config.useRelay, config.relayToken)}/${path}`, {
       ...init,
       headers,
       body,
@@ -2031,13 +2048,6 @@ export const ActiveMsgClient = {
   // 复制站点随 build 发布的 public/amsg-worker.bundle.js（Dashboard 粘贴部署用）。
   copyWorkerBundleToClipboard(): Promise<void> {
     return copyWorkerBundleToClipboard('amsg-worker.bundle.js');
-  },
-
-  // 复制 public/amsg-deno-proxy.ts —— 贴进 Deno Playground 当 worker 的门面用。
-  // 走的是同一套「fetch 站点静态文件 → 剪贴板」，只是这份不打包、原样发布，
-  // 因为用户要照着里面的注释改 UPSTREAM 那一行。
-  copyDenoProxyToClipboard(): Promise<void> {
-    return copyWorkerBundleToClipboard('amsg-deno-proxy.ts');
   },
 
   async getPushStatus(): Promise<ActiveMsg2PushStatus> {
@@ -2217,7 +2227,9 @@ export const ActiveMsgClient = {
 
   async sendTestPush(): Promise<{ sent: boolean }> {
     const config = await ensureWorkerReady();
-    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15000) : undefined;
+    // amsg-shared Web Push waits up to 30s. Leave room for that upstream result,
+    // encryption and transport; a 15s client abort hides the actual push error.
+    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(45_000) : undefined;
     const { status, body } = await fetchWithAuthRaw(
       'test-push',
       config,
@@ -2379,6 +2391,7 @@ export const ActiveMsgClient = {
    */
   async reconcilePushSubscription(): Promise<'registered' | 'skipped' | 'failed'> {
     const globalConfig = await ensureGlobalReady();
+    if (!isAmsg2WorkerActive(globalConfig)) return 'skipped';
     if (globalConfig.pushMode === 'third-party') {
       if (!validateThirdPartyPushConfig(globalConfig.thirdPartyPush).ok) return 'skipped';
       try {
@@ -2431,7 +2444,9 @@ export const ActiveMsgClient = {
   // （Dashboard 粘贴部署的用户不用碰 SQL），再拿一次 user key 验证地址与鉴权都通，
   // 最后把推送订阅补登记上去（换 worker 后云端那份是空的，见 reconcilePushSubscription）。
   async connect() {
-    const config = await ensureWorkerReady();
+    const config = await ensureWorkerReady({ allowWhenDisabled: true });
+    const wasDisabled = !isAmsg2GloballyEnabled(config);
+    const hadMasterPausedCron = readMasterPausedCron();
 
     // 先问 worker 配齐了没：缺 D1 绑定或 master key 的话，下面的 init-tenant 必然失败，
     // 而那一步只能按 HTTP 状态猜个大概（三种原因共用「建表失败」）。自检能直接说出
@@ -2469,13 +2484,31 @@ export const ActiveMsgClient = {
       anthropicMessagesWorkerUrl: _staleAnthropicWorkerUrl,
       ...handshakeConfig
     } = config;
-    await ActiveMsgStore.saveGlobalConfig({ ...handshakeConfig, initializedAt: Date.now() });
+    await ActiveMsgStore.saveGlobalConfig({ ...handshakeConfig, enabled: true, initializedAt: Date.now() });
+    if (wasDisabled) {
+      void this.probeInstantChatSupport().catch(() => {});
+    }
+    if (hadMasterPausedCron) {
+      try {
+        const cronRes = await this.setCronTriggerEnabled(true, { timeoutMs: 6_000 });
+        if (cronRes.ok || cronRes.code === 'CF_TOKEN_MISSING' || cronRes.code === 'NOT_FOUND') {
+          writeMasterPausedCron(false);
+        }
+      } catch {
+        // 恢复定时触发失败不拦住连接本身，保留标记供后续开关或面板继续补恢复
+      }
+    }
     // 「重新连接并验证」是用户显式的一次对表，按特性位存的能力位也当场探准，别等下次握手。
     // 排在保存之后：上面那句写的是握手前的配置快照，探测结论放它前面会被原样盖回去。
     await this.probeWorkerFeatures();
     await this.reconcilePushSubscription();
     const nativeToken = config.pushMode === 'third-party' ? '' : readNativePushToken();
     if (nativeToken) await this.registerNativePushToken(nativeToken);
+    if (wasDisabled || hadMasterPausedCron) {
+      void import('./amsgGlobalSwitch')
+        .then((mod) => mod.flushAmsg2AfterReenable())
+        .catch(() => {});
+    }
     // warnings 是「连上了，但有一块功能是哑的」——比如 VAPID 没配齐，任务能建、到点
     // 却一条都推不出去。连接本身算成功，交给调用方提示，别拦住流程。
     return { ok: true, userId: config.userId, warnings: report?.warnings ?? [] };
@@ -2530,7 +2563,7 @@ export const ActiveMsgClient = {
     // 换了 Master Key 时任务全是这种，按旧判断会叫用户去重新部署，越部署越乱。
     const readable = tasks.filter((t) => !t?.error);
     if (readable.length > 0 && readable.every((t) => t?.charId == null)) {
-      throw new Error('worker 版本过旧：任务列表没有 charId 投影，无法按角色对账，请在设置里重新粘贴部署。');
+      throw new Error('worker 版本过旧：任务列表没有 charId 投影，无法按角色对账，请去「设置 → 主动消息 2.0」点一下「更新 Worker」。');
     }
     return tasks
       .filter((t) => t?.charId === charId && typeof t?.uuid === 'string')
@@ -2558,10 +2591,17 @@ export const ActiveMsgClient = {
    * 成红色的「远端取消失败，可重试」，其实没有任何东西需要重试。
    * 其余错误（鉴权、D1 挂了、网络）照常抛，别一起吞掉。
    */
-  async cancelTask(taskUuid: string): Promise<{ uuid: string; alreadyGone: boolean }> {
-    const config = await ensureWorkerReady();
+  async cancelTask(
+    taskUuid: string,
+    options?: { allowWhenDisabled?: boolean; timeoutMs?: number },
+  ): Promise<{ uuid: string; alreadyGone: boolean }> {
+    const config = await ensureWorkerReady({ allowWhenDisabled: options?.allowWhenDisabled });
+    const signal = typeof options?.timeoutMs === 'number' && options.timeoutMs > 0 && typeof AbortSignal?.timeout === 'function'
+      ? AbortSignal.timeout(options.timeoutMs)
+      : undefined;
     const response = await fetchWithAuth(`cancel-message?id=${encodeURIComponent(taskUuid)}`, config, {
       method: 'DELETE',
+      ...(signal ? { signal } : {}),
     }, '取消任务');
 
     if (!response?.success) {
@@ -2754,6 +2794,10 @@ export const ActiveMsgClient = {
       expirePolicy?: ActiveMsg2ExpirePolicy;
       /** 角色自己排的（工具桥传 true）。带上 metadata 标记，连发上限的到点兜底闸只拦它。 */
       selfScheduled?: boolean;
+      /** 离开后消息（见 docs/away-message.md）：不占任务名额，指令换成「对方离开了这么久」那份。 */
+      away?: { delayMinutes: number };
+      /** 见面离开提醒（见 docs/date-leave-reminder.md）：同样不占任务名额。 */
+      dateLeave?: { delayMinutes: number };
     };
     /** 编辑/续期时传旧任务 uuid：先取消它再新建（不传 = 纯新建）。 */
     replaceTaskUuid?: string;
@@ -2777,7 +2821,8 @@ export const ActiveMsgClient = {
     const maxActiveTasks = resolveAmsgLimits(config).maxActiveTasks;
     const pendingOthers = getPendingTasks(config, Date.now())
       .filter((t) => t.taskUuid !== replaceTaskUuid);
-    if (pendingOthers.length >= maxActiveTasks) {
+    // 离开后消息是用户开的系统任务，不跟角色抢名额；名额满时它也不能建不出来。
+    if (!task.away && !task.dateLeave && pendingOthers.length >= maxActiveTasks) {
       throw new Error(`该角色已经排好了 ${maxActiveTasks} 次主动消息，到上限了（上限在「主动频率」里调），请先取消或合并已有的。`);
     }
 
@@ -2825,6 +2870,8 @@ export const ActiveMsgClient = {
         amsgExpirePolicy: resolveExpirePolicy(task.mode, task.expirePolicy),
         // 自排标记：到点兜底闸只拦带它的任务（用户面板排的不带、不受连发上限管）。
         ...(task.selfScheduled ? { amsgSelfScheduled: true } : {}),
+        ...(task.away ? { [AMSG_AWAY_MESSAGE_META]: true, [AMSG_AWAY_DELAY_META]: task.away.delayMinutes } : {}),
+        ...(task.dateLeave ? { [AMSG_DATE_LEAVE_META]: true, [AMSG_DATE_LEAVE_DELAY_META]: task.dateLeave.delayMinutes } : {}),
       },
     };
 
@@ -2841,7 +2888,10 @@ export const ActiveMsgClient = {
       const activeApi = resolveApiConfig(char, config, apiConfig);
       await requireAnthropicWorker([normalizeChatApiUrl(activeApi.baseUrl, activeApi.apiType)]);
       // 「本次任务」指令随任务 metadata 走，worker 到点拿它填 fire_pack 的指令槽。
-      payload.metadata.amsgTaskInstruction = buildTaskInstruction(task.mode, task.promptHint);
+      payload.metadata.amsgTaskInstruction = task.away
+        ? buildAwayTaskInstruction(task.away.delayMinutes)
+        : task.dateLeave ? buildDateLeaveInstruction()
+        : buildTaskInstruction(task.mode, task.promptHint);
       // 服务端要求「completePrompt 或 messages」二选一，且 messages 必须非空、
       // content 必须非空字符串，所以这里给一条占位。到点真正发给 LLM 的 messages 由
       // worker 的 onBeforeFire 返回值覆盖（库用 { ...payload, messages } 调 LLM），
@@ -3054,7 +3104,7 @@ export const ActiveMsgClient = {
     assertWriteCurrent();
 
     if (!await isLlmCredentialsReady()) {
-      throw new Error('这台 Worker 还不支持凭据存表，后台任务跑不了（去设置页重新部署一次）。');
+      throw new Error('这台 Worker 还不支持凭据存表，后台任务跑不了（去「设置 → 主动消息 2.0」点一下「更新 Worker」）。');
     }
 
     const now = stampStateUpdatedAt();
@@ -3726,6 +3776,7 @@ export const ActiveMsgClient = {
    * 就是「那台 Worker 贴的是旧 bundle」。
    *
    * 三种拿不到结论的情况分开表态，因为界面上该说的话不一样：
+   *   - Worker 报的版本比 App 认的还新 → ahead（App 是缓存的旧构建，该刷新页面，不该动 Worker）；
    *   - 老 bundle 根本不报这个字段 → outdated（它确实旧，只是旧到还不会自报家门）；
    *   - 网络不通 / 还没连上 → unknown（别在用户断网时催他更新）。
    */
@@ -3749,7 +3800,9 @@ export const ActiveMsgClient = {
       const deployed = typeof body?.data?.workerVersion === 'string' ? body.data.workerVersion : null;
       const autoUpdate = parseSelfUpdateReport(body?.data?.selfUpdate);
       if (!deployed) return { state: 'outdated', deployed: null, expected, autoUpdate };
-      return { state: deployed === expected ? 'current' : 'outdated', deployed, expected, autoUpdate };
+      if (deployed === expected) return { state: 'current', deployed, expected, autoUpdate };
+      const order = compareBundleVersions(deployed, expected);
+      return { state: order !== null && order > 0 ? 'ahead' : 'outdated', deployed, expected, autoUpdate };
     } catch {
       return { state: 'unknown', deployed: null, expected, autoUpdate: null };
     } finally {
@@ -3835,10 +3888,20 @@ export const ActiveMsgClient = {
    * 回 null 表示问不到：旧版 Worker 没有这个端点（404）、没填地址、或者这一次没连上。
    * 三种都按「不支持」处理——设置页不显示那个按钮，也不报错。
    */
-  async getCronTriggerState(): Promise<AmsgCronTriggerState | null> {
+  async getCronTriggerState(
+    options?: { allowWhenDisabled?: boolean; timeoutMs?: number },
+  ): Promise<AmsgCronTriggerState | null> {
     try {
-      const config = await ensureWorkerReady();
-      const { status, body } = await fetchWithAuthRaw('cron-trigger', config, { method: 'GET' }, '后台任务状态');
+      const config = await ensureWorkerReady({ allowWhenDisabled: options?.allowWhenDisabled });
+      const signal = typeof options?.timeoutMs === 'number' && options.timeoutMs > 0 && typeof AbortSignal?.timeout === 'function'
+        ? AbortSignal.timeout(options.timeoutMs)
+        : undefined;
+      const { status, body } = await fetchWithAuthRaw(
+        'cron-trigger',
+        config,
+        { method: 'GET', ...(signal ? { signal } : {}) },
+        '后台任务状态',
+      );
       // 旧 worker 没有这个端点：可能回 404，也可能被上游当成未知路由回一段自己的 JSON。
       if (status === 404 || body?.error?.code === 'NOT_FOUND') return null;
       if (status === 200 && body?.success === true) {
@@ -3869,17 +3932,29 @@ export const ActiveMsgClient = {
    * 成功和失败都带一句能直接显示的话；code 是 worker 报的代号，缺 CF_API_TOKEN 时
    * 面板据此露出补钥匙那一块。网络层面的失败照常抛（跟 selfUpdateWorker 一样），调用方兜。
    */
-  async setCronTriggerEnabled(enabled: boolean): Promise<{ ok: boolean; message: string; code?: string }> {
-    const config = await ensureWorkerReady();
+  async setCronTriggerEnabled(
+    enabled: boolean,
+    options?: { allowWhenDisabled?: boolean; timeoutMs?: number },
+  ): Promise<{ ok: boolean; message: string; code?: string }> {
+    const config = await ensureWorkerReady({ allowWhenDisabled: options?.allowWhenDisabled });
+    const signal = typeof options?.timeoutMs === 'number' && options.timeoutMs > 0 && typeof AbortSignal?.timeout === 'function'
+      ? AbortSignal.timeout(options.timeoutMs)
+      : undefined;
     const { status, body } = await fetchWithAuthRaw(
       'cron-trigger',
       config,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) },
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+        ...(signal ? { signal } : {}),
+      },
       enabled ? '恢复后台任务' : '暂停后台任务',
     );
     if (status === 404 || body?.error?.code === 'NOT_FOUND') {
       return {
         ok: false,
+        code: 'NOT_FOUND',
         message: '这台 Worker 还是旧版本，没有暂停后台任务的能力。先点「更新 Worker」，之后就能在这儿点了。',
       };
     }
@@ -4103,6 +4178,9 @@ export const ActiveMsgClient = {
 
     const uuids = getPendingTasks(char.activeMsg2Config, Date.now()).map((t) => t.taskUuid);
     if (uuids.length === 0) return { status: 'no-tasks', updated: 0, failed: 0 };
+    if (!isAmsg2WorkerActive(await ensureGlobalReady())) {
+      return { status: 'no-tasks', updated: 0, failed: 0 };
+    }
 
     const { updated, failed } = await this.updatePendingTasksRemote(uuids, updates);
     return { status: failed.length ? 'partial' : 'ok', updated, failed: failed.length };
@@ -4276,5 +4354,11 @@ export const ActiveMsgClient = {
       toolConfigRestored = false;
     }
     return { deleted, toolConfigRestored };
+  },
+
+  /** 总开关切换时清空内存中的握手与后台能力缓存，避免复用暂停前的会话状态。 */
+  resetSessionCache(): void {
+    invalidateClientCache();
+    forgetBackgroundJobProbe();
   },
 };

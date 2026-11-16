@@ -26,14 +26,20 @@ import { getReplyDisplayIds, isReplyStopped, markReplyStopped, replyAbortError }
 
 import { ActiveMsg2InboxMessage, CharacterProfile, GroupProfile, RealtimeConfig, UserProfile } from '../types';
 import { ActiveMsgClient, type AmsgOutboxEntry, type InstantChatProbeOutcome } from './activeMsgClient';
-import { ActiveMsgStore } from './activeMsgStore';
+import { ActiveMsgStore, isInstantChatSwitchedOn } from './activeMsgStore';
+import { isAmsg2GloballyEnabled } from './amsgGlobalGate';
 import { trackEvent } from './analytics';
-import { cloudApiCallLogId, recordCloudApiCall, settleCloudApiCall } from './apiCallLog';
+import {
+  cloudApiCallLogId,
+  cloudEmotionApiCallLogId,
+  recordCloudApiCall,
+  settleCloudApiCall,
+} from './apiCallLog';
 import { announceEmotionDone } from './chatGenEvents';
 import { dispatchAmsgResult } from './amsgResults';
 import { DB } from './db';
 import type { AmsgEmotionEvalSpec } from '../worker/amsg/src/emotionEval';
-import { AMSG_BUNDLE_VERSION } from './amsgBundleVersion';
+import { AMSG_BUNDLE_VERSION, compareBundleVersions } from './amsgBundleVersion';
 import type { AmsgSarModuleSnapshot } from './vrWorld/sarEnvelopeCore';
 
 const HEADER = '[AmsgInstantChat]';
@@ -43,6 +49,43 @@ export const INSTANT_CHAT_STATUS_CHECK_INTERVAL_MS = 60_000;
 
 /** 待收记录的落盘位置。存 localStorage 而不是内存：重启后指示灯要还在。 */
 export const AMSG_INSTANT_CHAT_PENDING_LS_KEY = 'amsg2_instant_chat_pending';
+
+/** 随即时对话一并起跑了云端情绪评估的轮次 uuid（收尾时据此结清对应的情绪评估调用记录）。 */
+export const AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY = 'amsg2_instant_emotion_inflight_v1';
+const MAX_EMOTION_INFLIGHT_TRACKED = 32;
+
+const readEmotionEvalInFlight = (): string[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((id): id is string => typeof id === 'string' && !!id);
+  } catch {
+    return [];
+  }
+};
+
+const writeEmotionEvalInFlight = (ids: string[]) => {
+  try {
+    if (ids.length === 0) localStorage.removeItem(AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY);
+    else localStorage.setItem(AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY, JSON.stringify(ids.slice(-MAX_EMOTION_INFLIGHT_TRACKED)));
+  } catch { /* 写不进去只影响这一笔记录的云端状态收尾 */ }
+};
+
+const markEmotionEvalInFlight = (uuid: string): void => {
+  if (!uuid) return;
+  const list = readEmotionEvalInFlight().filter((id) => id !== uuid);
+  list.push(uuid);
+  writeEmotionEvalInFlight(list);
+};
+
+const consumeEmotionEvalInFlight = (uuid: string | null | undefined): boolean => {
+  if (!uuid) return false;
+  const list = readEmotionEvalInFlight();
+  const next = list.filter((id) => id !== uuid);
+  if (next.length === list.length) return false;
+  writeEmotionEvalInFlight(next);
+  return true;
+};
 
 /** 待收记录变动时广播；Chat 界面据此点亮/熄灭「正在输入…」。detail 只带 charId。 */
 export const AMSG_INSTANT_CHAT_PENDING_EVENT = 'amsg-instant-chat-pending';
@@ -249,8 +292,8 @@ export interface InstantChatReadiness {
   ready: boolean;
   reason?: InstantChatReadinessReason;
   /**
-   * 那台 Worker 贴的是不是本 App 认的这一版 bundle（存量 workerBundleVersion 与
-   * AMSG_BUNDLE_VERSION 相等）。只在 ready 时给：true / false 是探到过的结论，
+   * 那台 Worker 贴的 bundle 是否不旧于本 App 认的这一版（存量 workerBundleVersion 等于或
+   * 新于 AMSG_BUNDLE_VERSION；App 还是缓存的旧构建时 Worker 会更新，那也认得新协议）。只在 ready 时给：true / false 是探到过的结论，
    * undefined = 不知道。不传 ensureBundleVersion 时它就是「还没探过」；传了的话
    * 存量为空会当场现探一次，那时 undefined 意味着「现探也没问到」。
    *
@@ -260,14 +303,15 @@ export interface InstantChatReadiness {
   workerBundleCurrent?: boolean;
 }
 
-/** 存量里那台 Worker 的 bundle 版本是不是当前这一版；没探过（undefined）返回 undefined。 */
+/** 存量里那台 Worker 的 bundle 版本是否不旧于当前这一版；没探过（undefined）返回 undefined。 */
 const resolveWorkerBundleCurrent = (
   config: { workerBundleVersion?: string | null },
-): boolean | undefined => (
-  config.workerBundleVersion === undefined
-    ? undefined
-    : config.workerBundleVersion === AMSG_BUNDLE_VERSION
-);
+): boolean | undefined => {
+  const deployed = config.workerBundleVersion;
+  if (deployed === undefined) return undefined;
+  if (deployed === null) return false;
+  return deployed === AMSG_BUNDLE_VERSION || (compareBundleVersions(deployed, AMSG_BUNDLE_VERSION) ?? -1) > 0;
+};
 
 /** ready 的那一档带上 bundle 结论；不知道就不带这个键。 */
 const readyWithBundle = (workerBundleCurrent: boolean | undefined): InstantChatReadiness => (
@@ -356,7 +400,7 @@ const probeBundleCurrentNow = async (): Promise<boolean | undefined> => {
     try {
       // 问到答案时 probeWorkerVersion 会顺手把版本存进 workerBundleVersion。
       const { state } = await ActiveMsgClient.probeWorkerVersion({ timeoutMs: INSTANT_CHAT_REPROBE_TIMEOUT_MS });
-      return state === 'current' ? true : state === 'outdated' ? false : undefined;
+      return state === 'current' || state === 'ahead' ? true : state === 'outdated' ? false : undefined;
     } catch {
       return undefined;
     }
@@ -427,7 +471,8 @@ export const resolveInstantChatReadiness = async (
     console.warn(`${HEADER} 全局配置读不出来，这一轮判断不了即时对话开没开（按走不通处理，但这不是「没开」）`, error);
     return { ready: false, reason: 'config-unreadable' };
   }
-  if (!config.instantChatEnabled) return { ready: false, reason: 'disabled' };
+  if (!isAmsg2GloballyEnabled(config)) return { ready: false, reason: 'disabled' };
+  if (!isInstantChatSwitchedOn(config)) return { ready: false, reason: 'disabled' };
   // 地址排在能力前面：没填地址时那份能力位多半是上一台 Worker 留下的存量，
   // 报「Worker 太旧」会把人指去点一个根本没连上的东西。
   if (!config.workerUrl?.trim()) return { ready: false, reason: 'no-worker-url' };
@@ -563,10 +608,18 @@ export const sendInstantChatTurn = async (params: {
   // meta 跟本地生成那条路对齐（useChatAI 传给 safeFetchJson 的那份），两条路在列表里
   // 长得一样，只多一个云端标记。
   const logMeta = {
+    appId: 'chat',
     appName: '消息',
     charId: params.char.id,
     charName: params.char.name,
     purpose: '聊天回复',
+  };
+  const emotionLogMeta = {
+    appId: 'chat',
+    appName: '消息',
+    charId: params.char.id,
+    charName: params.char.name,
+    purpose: '情绪评估',
   };
   try {
     params.signal?.throwIfAborted();
@@ -603,11 +656,26 @@ export const sendInstantChatTurn = async (params: {
       messages: params.chatMessages,
       meta: logMeta,
     });
+    if (params.emotionEval) {
+      markEmotionEvalInFlight(uuid);
+      const evalApi = params.emotionEval.api ?? params.api;
+      recordCloudApiCall({
+        id: cloudEmotionApiCallLogId(uuid),
+        route: 'cloud-emotion-eval',
+        baseUrl: evalApi.baseUrl,
+        model: evalApi.model,
+        messages: [...params.chatMessages, { role: 'user', content: params.emotionEval.prompt }],
+        meta: emotionLogMeta,
+      });
+    }
     // 顶掉的那一轮也得收尾：客户端从这一刻起不再等它的回复了（云端把两句合成一次回，
     // 它已经在跑的情况下顶不掉，但那份回复也认不回这条记录）。不收的话它会一直写着
     // 「云端生成中」，直到 5 天后被裁掉。
     if (supersedes) {
       settleCloudApiCall({ id: cloudApiCallLogId(supersedes.uuid), ok: true, superseded: true });
+      if (consumeEmotionEvalInFlight(supersedes.uuid)) {
+        settleCloudApiCall({ id: cloudEmotionApiCallLogId(supersedes.uuid), ok: true, superseded: true });
+      }
     }
     return { ok: true, uuid };
   } catch (error: any) {
@@ -630,6 +698,18 @@ export const sendInstantChatTurn = async (params: {
       meta: logMeta,
       sendFailed: true,
     });
+    if (params.emotionEval) {
+      const evalApi = params.emotionEval.api ?? params.api;
+      recordCloudApiCall({
+        id: `cloud-emotion-send-failed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        route: 'cloud-emotion-eval',
+        baseUrl: evalApi.baseUrl,
+        model: evalApi.model,
+        messages: [...params.chatMessages, { role: 'user', content: params.emotionEval.prompt }],
+        meta: emotionLogMeta,
+        sendFailed: true,
+      });
+    }
     return { ok: false, error: error?.message || String(error) };
   } finally {
     params.signal?.removeEventListener('abort', stopSending);
@@ -653,13 +733,30 @@ export const settleInstantChatApiLog = (uuid: string, metadata?: Record<string, 
     (typeof value === 'number' && Number.isFinite(value) ? value : undefined);
   const usage = metadata?.amsgUsage;
   const toolTrace = metadata?.amsgToolTrace;
+  const hasToolTrace = Array.isArray(toolTrace) && toolTrace.length > 0;
   settleCloudApiCall({
     id: cloudApiCallLogId(uuid),
     ok: !isReplyStopped(uuid),
     promptTokens: num(usage?.promptTokens),
     completionTokens: num(usage?.completionTokens),
-    tokensPartial: Array.isArray(toolTrace) && toolTrace.length > 0,
+    tokensPartial: metadata?.amsgUsageComplete === true ? false : hasToolTrace,
   });
+  if (metadata?.amsgEmotionPending === true) return;
+  if (consumeEmotionEvalInFlight(uuid)) {
+    const emotionUsage = metadata?.amsgEmotionUsage;
+    settleCloudApiCall({
+      id: cloudEmotionApiCallLogId(uuid),
+      ok: !isReplyStopped(uuid) && !metadata?.amsgEmotionError,
+      promptTokens: num(emotionUsage?.promptTokens),
+      completionTokens: num(emotionUsage?.completionTokens),
+    });
+  }
+};
+
+/** 晚投情绪评估在旁路补落或轮询超时收尾时，结清对应的云端情绪评估记录。 */
+export const settleLateCloudEmotionEvalLog = (uuid: string | null | undefined, ok: boolean): void => {
+  if (!consumeEmotionEvalInFlight(uuid)) return;
+  settleCloudApiCall({ id: cloudEmotionApiCallLogId(uuid!), ok: ok && !isReplyStopped(uuid) });
 };
 
 // ─── 推送丢了的兜底：拉服务端消息账本 ───
@@ -909,6 +1006,9 @@ export const failInstantChatPending = async (
   trackEvent('即时对话云端任务失败');
   // 「API 调用记录」里那笔挂着的也收尾，否则它会一直写着「云端生成中」直到被裁掉。
   settleCloudApiCall({ id: cloudApiCallLogId(uuid), ok: false });
+  if (consumeEmotionEvalInFlight(uuid)) {
+    settleCloudApiCall({ id: cloudEmotionApiCallLogId(uuid), ok: false });
+  }
   try {
     await DB.saveMessage({
       charId,
@@ -935,6 +1035,9 @@ export const stopInstantChat = async (charId: string): Promise<void> => {
   void import('./friendFeedEmotion').then(m=>m.settleFriendFeedCloudTask(charId,pending.uuid,false)).catch(()=>{});
   announceEmotionDone(charId);
   settleCloudApiCall({ id: cloudApiCallLogId(pending.uuid), ok: false });
+  if (consumeEmotionEvalInFlight(pending.uuid)) {
+    settleCloudApiCall({ id: cloudEmotionApiCallLogId(pending.uuid), ok: false });
+  }
   // Issue cancellation immediately; history reconciliation must not delay the remote abort.
   const cancel = ActiveMsgClient.cancelTask(pending.uuid);
   const keptText = stageStoppedReplyReceipt(charId, pending.uuid, (async () => {
@@ -951,4 +1054,45 @@ export const stopInstantChat = async (charId: string): Promise<void> => {
   const results = await Promise.allSettled([cancel, reconcile]);
   const failed = results.find(result => result.status === 'rejected');
   if (failed?.status === 'rejected') throw failed.reason;
+};
+
+/**
+ * 全局总开关关闭时立即收束本机所有正在等待的即时对话轮次：熄灭输入中与情绪灯、结清调用记录、
+ * 清理未展示的分段，返回待尽力取消的远端任务 UUID 列表（不在此处等待网络）。
+ */
+export const abortAllInstantChatPendingsLocally = async (): Promise<string[]> => {
+  const pendings = listInstantChatPendings();
+  if (pendings.length === 0) return [];
+  const uuids: string[] = [];
+  for (const pending of pendings) {
+    const visibleIds = getReplyDisplayIds(pending.charId);
+    markReplyStopped(pending.uuid);
+    clearInstantChatPending(pending.charId);
+    discardInstantChatExpiredNotices(pending.charId, pending.uuid);
+    void import('./friendFeedEmotion')
+      .then((m) => m.settleFriendFeedCloudTask(pending.charId, pending.uuid, false))
+      .catch(() => {});
+    announceEmotionDone(pending.charId);
+    settleCloudApiCall({ id: cloudApiCallLogId(pending.uuid), ok: false });
+    if (consumeEmotionEvalInFlight(pending.uuid)) {
+      settleCloudApiCall({ id: cloudEmotionApiCallLogId(pending.uuid), ok: false });
+    }
+    uuids.push(pending.uuid);
+    await stageStoppedReplyReceipt(pending.charId, pending.uuid, (async () => {
+      try {
+        const messages = (await DB.getMessagesByCharId(pending.charId)).filter((message) =>
+          (message.metadata as any)?.activeMsg2?.taskUuid === pending.uuid);
+        const kept = messages.filter((message) => !visibleIds || visibleIds.has(message.id));
+        const unseen = messages.filter((message) => visibleIds && !visibleIds.has(message.id));
+        if (unseen.length) await DB.deleteMessages(unseen.map((message) => message.id));
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('active-msg-progress', { detail: { charId: pending.charId } }));
+        }
+        return kept.map((message) => message.content).join('\n');
+      } catch {
+        return '';
+      }
+    })());
+  }
+  return uuids;
 };
