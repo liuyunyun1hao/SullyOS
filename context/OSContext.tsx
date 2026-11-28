@@ -152,6 +152,7 @@ import { assertSupportedSullyBackup, createImportProgressMarker, IMPORT_IN_PROGR
 import { createBuiltinSullyLive2DConfig, isBuiltinSullyLive2D, upgradeBuiltinSullyLive2DDefaults } from '../utils/builtinSullyLive2D';
 import { normalizeCharacterRoomAssetsInPlace } from '../utils/roomTemplateAssets';
 import { consumeCanaryFallbackNotice } from '../utils/releaseChannel';
+import { autoBackupDue, loadAutoBackupConfig, saveAutoBackupConfig } from '../utils/autoBackup';
 import { resolveDisplayAccent } from '../utils/canaryTheme';
 
 
@@ -2975,6 +2976,35 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           throw e;
       }
   };
+
+  // 自动上传备份：页面开着时每 60 秒检查一次是否到期。
+  // 浏览器里没有后台常驻能力，所以关掉页面就停，这是平台限制不是 bug。
+  const autoBackupRunnerRef = useRef<((mode: 'text_only' | 'full') => Promise<void>) | null>(null);
+  autoBackupRunnerRef.current = cloudBackupToWebDAV;
+  const autoBackupBusyRef = useRef(false);
+  useEffect(() => {
+      const tick = async () => {
+          if (autoBackupBusyRef.current) return;
+          if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+          const config = loadAutoBackupConfig();
+          if (!autoBackupDue(config, Date.now())) return;
+          const runner = autoBackupRunnerRef.current;
+          if (!runner) return;
+          autoBackupBusyRef.current = true;
+          try {
+              await runner(config.mode);
+              saveAutoBackupConfig({ ...config, lastRunAt: Date.now() });
+          } catch {
+              // cloudBackupToWebDAV 内部已经 toast 过；这里只把时间往后推，
+              // 免得每分钟重试把配额打光和反复弹错。
+              saveAutoBackupConfig({ ...config, lastRunAt: Date.now() });
+          } finally {
+              autoBackupBusyRef.current = false;
+          }
+      };
+      const timer = setInterval(() => { void tick(); }, 60_000);
+      return () => clearInterval(timer);
+  }, []);
 
   const cloudRestoreFromWebDAV = (file: CloudBackupFile, importOptions?: ImportSystemOptions) => withScreenAwake(async () => {
       const { downloadBackup } = await loadBackupProvider();

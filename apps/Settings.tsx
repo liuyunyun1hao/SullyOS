@@ -82,6 +82,7 @@ import {
     type AvatarModelBackupProgress,
 } from '../utils/avatarModelBackup';
 import { normalizeApiBaseUrl, normalizeApiCredential, normalizeApiModel } from '../utils/apiConfigNormalize';
+import { formatAutoBackupInterval, loadAutoBackupConfig, saveAutoBackupConfig, sliderToAutoBackupMinutes, autoBackupMinutesToSlider } from '../utils/autoBackup';
 import { configFromPreset, findActivePresetId, presetDiffersFromConfig, type PresetSwitchPatch } from '../utils/apiPresetSwitch';
 import type { APIConfig, TtsProvider, SttProvider } from '../types';
 import {
@@ -672,6 +673,10 @@ const Settings: React.FC = () => {
   const [showCloudModal, setShowCloudModal] = useState(false);
   const [showGithubModal, setShowGithubModal] = useState(false);
   const [showCloudRestoreModal, setShowCloudRestoreModal] = useState(false);
+  const [autoBackupConfig, setAutoBackupConfig] = useState(() => loadAutoBackupConfig());
+  const updateAutoBackupConfig = (patch: Partial<ReturnType<typeof loadAutoBackupConfig>>) => {
+      setAutoBackupConfig(prev => saveAutoBackupConfig({ ...prev, ...patch }));
+  };
   const [cloudBackupFiles, setCloudBackupFiles] = useState<import('../types').CloudBackupFile[]>([]);
   const [cloudBackupListState, setCloudBackupListState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [cloudBackupListError, setCloudBackupListError] = useState('');
@@ -2475,6 +2480,79 @@ const Settings: React.FC = () => {
                 )}
             </div>
             </> : <>
+            {/* 自动上传备份：间隔 20 分钟 ~ 24 小时，滑块走对数刻度 */}
+                    <div className="mt-1 p-3 bg-white border border-slate-200 rounded-xl space-y-2.5">
+                        <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                                <div className="text-xs font-bold text-slate-700">自动上传备份</div>
+                                <div className="text-[10px] text-slate-400 leading-relaxed mt-0.5">
+                                    {cloudBackupConfig.enabled ? '页面开着的时候，按下面的间隔自动备份到云端' : '先在上面连接 GitHub 或 WebDAV，才能自动备份'}
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                role="switch"
+                                aria-checked={autoBackupConfig.enabled}
+                                aria-label="自动上传备份"
+                                disabled={!cloudBackupConfig.enabled}
+                                title={cloudBackupConfig.enabled ? undefined : "先连接一个云备份服务商"}
+                                onClick={() => updateAutoBackupConfig({ enabled: !autoBackupConfig.enabled })}
+                                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${!cloudBackupConfig.enabled ? 'opacity-40 cursor-not-allowed' : ''} ${autoBackupConfig.enabled ? 'bg-green-500' : 'bg-slate-300'}`}
+                            >
+                                <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${autoBackupConfig.enabled ? 'left-[22px]' : 'left-0.5'}`} />
+                            </button>
+                        </div>
+
+                        {autoBackupConfig.enabled && (
+                            <>
+                                <div className="pt-1">
+                                    <div className="flex items-baseline justify-between mb-1.5">
+                                        <span className="text-[10px] text-slate-400">间隔</span>
+                                        <span className="text-xs font-bold text-sky-600">{formatAutoBackupInterval(autoBackupConfig.intervalMinutes)}</span>
+                                    </div>
+                                    <input
+                                        type="range"
+                                        min={0}
+                                        max={100}
+                                        step={1}
+                                        value={autoBackupMinutesToSlider(autoBackupConfig.intervalMinutes)}
+                                        aria-label="自动备份间隔"
+                                        onChange={event => updateAutoBackupConfig({ intervalMinutes: sliderToAutoBackupMinutes(Number(event.target.value)) })}
+                                        className="w-full accent-sky-500"
+                                    />
+                                    <div className="flex justify-between text-[9px] text-slate-400 mt-0.5">
+                                        <span>20 分钟</span>
+                                        <span>24 小时</span>
+                                    </div>
+                                </div>
+
+                                <div className="flex gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => updateAutoBackupConfig({ mode: 'text_only' })}
+                                        className={`flex-1 py-2 rounded-lg text-[11px] font-bold border transition-colors ${autoBackupConfig.mode === 'text_only' ? 'bg-sky-50 border-sky-200 text-sky-600' : 'bg-white border-slate-200 text-slate-500'}`}
+                                    >
+                                        纯文字
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => updateAutoBackupConfig({ mode: 'full' })}
+                                        className={`flex-1 py-2 rounded-lg text-[11px] font-bold border transition-colors ${autoBackupConfig.mode === 'full' ? 'bg-violet-50 border-violet-200 text-violet-600' : 'bg-white border-slate-200 text-slate-500'}`}
+                                    >
+                                        完整（含图片）
+                                    </button>
+                                </div>
+
+                                <p className="text-[10px] text-slate-400 leading-relaxed">
+                                    只在页面打开时运行，关掉页面就会暂停，这是浏览器的限制。间隔越短越费流量和接口配额，建议 2 小时以上。
+                                    {autoBackupConfig.lastRunAt && (
+                                        <span className="block mt-1">上次自动备份：{new Date(autoBackupConfig.lastRunAt).toLocaleString('zh-CN')}</span>
+                                    )}
+                                </p>
+                            </>
+                        )}
+                    </div>
+
             {!cloudBackupConfig.enabled ? (
                 <div className="space-y-3 py-2">
                     <p className="text-[11px] text-slate-400 leading-relaxed text-center">
